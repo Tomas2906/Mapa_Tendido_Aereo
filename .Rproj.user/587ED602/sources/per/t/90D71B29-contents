@@ -1,3 +1,11 @@
+# --- INSTALACIÓN AUTOMÁTICA DE LIBRERÍAS SI FALTA ALGUNA EN RENDER ---
+paquetes_requeridos <- c("shiny", "bslib", "leaflet", "plotly", "sf", "dplyr", "openxlsx", "tidyr")
+paquetes_faltantes  <- paquetes_requeridos[!(paquetes_requeridos %in% installed.packages()[, "Package"])]
+
+if (length(paquetes_faltantes) > 0) {
+  install.packages(paquetes_faltantes, repos = "https://cloud.r-project.org")
+}
+
 options(shiny.selectize.check = FALSE)
 
 library(shiny)
@@ -10,9 +18,9 @@ library(openxlsx)
 library(tidyr)
 
 # =============================================================================
-# 0. RUTAS RELATIVAS AL PROYECTO
+# 0. RUTA BASE Y RUTAS DE ARCHIVOS
 # =============================================================================
-base_dir <- "data"
+base_dir <- file.path(getwd(), "data")
 
 path_cao_metrotel        <- file.path(base_dir, "CAO/Metrotel/CAO - METROTEL CALLEJERO.shp")
 path_reordenamiento     <- file.path(base_dir, "Reordenamiento_de_Cables/Reordenamiento de cables consolidado.shp")
@@ -33,20 +41,15 @@ path_intimadas          <- file.path(base_dir, "Trazas_intimadas/Trazas Intimada
 url_comunas <- "https://cdn.buenosaires.gob.ar/datosabiertos/datasets/ministerio-de-educacion/comunas/comunas.geojson"
 url_barrios <- "https://cdn.buenosaires.gob.ar/datosabiertos/datasets/barrios/barrios.geojson"
 
-comunas_sf <- tryCatch(st_read(url_comunas, quiet = TRUE) %>% st_transform(4326), error = function(e) NULL)
-barrios_sf <- tryCatch(st_read(url_barrios, quiet = TRUE) %>% st_transform(4326), error = function(e) NULL)
+comunas_sf <- st_read(url_comunas, quiet = TRUE) %>% st_transform(4326)
+barrios_sf <- st_read(url_barrios, quiet = TRUE) %>% st_transform(4326)
 
-if (!is.null(comunas_sf) && !is.null(barrios_sf)) {
-  col_comuna_sf      <- names(comunas_sf)[grep("comuna", names(comunas_sf), ignore.case = TRUE)][1]
-  col_comuna_barrios <- names(barrios_sf)[grep("comuna", names(barrios_sf), ignore.case = TRUE)][1]
-  col_barrio_sf      <- names(barrios_sf)[grep("barrio", names(barrios_sf), ignore.case = TRUE)][1]
-  
-  lista_comunas <- sort(as.character(unique(comunas_sf[[col_comuna_sf]])))
-  lista_barrios <- sort(as.character(unique(barrios_sf[[col_barrio_sf]])))
-} else {
-  lista_comunas <- character()
-  lista_barrios <- character()
-}
+col_comuna_sf      <- names(comunas_sf)[grep("comuna", names(comunas_sf), ignore.case = TRUE)][1]
+col_comuna_barrios <- names(barrios_sf)[grep("comuna", names(barrios_sf), ignore.case = TRUE)][1]
+col_barrio_sf      <- names(barrios_sf)[grep("barrio", names(barrios_sf), ignore.case = TRUE)][1]
+
+lista_comunas <- sort(as.character(unique(comunas_sf[[col_comuna_sf]])))
+lista_barrios <- sort(as.character(unique(barrios_sf[[col_barrio_sf]])))
 
 # =============================================================================
 # 2. HELPERS DE CARGA
@@ -155,6 +158,7 @@ armar_popup <- function(nombre_capa, calle = "-", desde = "-", hasta = "-", empr
 
 extraer_atributos_calle <- function(df, nombre_capa, empresa_default = "Sin Especificar") {
   col_calle   <- obtener_atributo(df, "nomoficial|calle|arteria")
+  
   col_derini <- obtener_atributo(df, "alt_derini")
   col_izqfin <- obtener_atributo(df, "alt_izqfin")
   
@@ -377,7 +381,7 @@ ui <- fillPage(
   theme = bs_theme(version = 5, bootswatch = "flatly"),
   leafletOutput("mapa", width = "100%", height = "100vh"),
   
-  # Panel Superior Derecho
+  # Panel Superior Derecho (Desplegable)
   absolutePanel(
     top = 15, right = 15, width = 420,
     style = "z-index: 1000;",
@@ -433,7 +437,7 @@ ui <- fillPage(
       capa_control("chk_policia", "Tendido de Policía Federal", value = FALSE, items = list("Policía Federal" = color_policia))
     ),
     
-    # Panel de Gráficos
+    # Panel de Gráficos (Desplegable)
     tags$details(
       style = "background: rgba(255, 255, 255, 0.96); padding: 10px 14px; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,0.12);",
       tags$summary(
@@ -456,12 +460,12 @@ ui <- fillPage(
 )
 
 # =============================================================================
-# 5. SERVIDOR (SERVER)
+# 5. SERVIDOR (SERVER) - OPTIMIZADO
 # =============================================================================
 server <- function(input, output, session) {
   
   observeEvent(input$sel_comuna, {
-    if (input$sel_comuna != "Todas" && !is.null(barrios_sf)) {
+    if (input$sel_comuna != "Todas") {
       barrios_filtrados <- barrios_sf %>%
         filter(as.character(.data[[col_comuna_barrios]]) == as.character(input$sel_comuna)) %>%
         pull(.data[[col_barrio_sf]]) %>% as.character() %>% unique() %>% sort()
@@ -472,9 +476,9 @@ server <- function(input, output, session) {
   }, ignoreInit = FALSE)
   
   geo_filtro <- reactive({
-    if (input$sel_barrio != "Todos" && !is.null(barrios_sf)) {
+    if (input$sel_barrio != "Todos") {
       barrios_sf %>% filter(as.character(.data[[col_barrio_sf]]) == input$sel_barrio)
-    } else if (input$sel_comuna != "Todas" && !is.null(comunas_sf)) {
+    } else if (input$sel_comuna != "Todas") {
       comunas_sf %>% filter(as.character(.data[[col_comuna_sf]]) == input$sel_comuna)
     } else {
       NULL
@@ -522,10 +526,11 @@ server <- function(input, output, session) {
       setView(lng = -58.445, lat = -34.615, zoom = 12)
   })
   
-  # --- 1. DIBUJO DE CAPAS ---
+  # --- 1. DIBUJO DE CAPAS EN EL MAPA (Se activa SOLO al cambiar el filtro territorial) ---
   observe({
     proxy <- leafletProxy("mapa")
     
+    # Limpiamos los grupos vectoriales
     proxy %>% 
       clearGroup("Reordenamiento de Cables") %>% clearGroup("CAO Metrotel") %>%
       clearGroup("Zonas APH") %>% clearGroup("Trazas APH") %>% clearGroup("Polígonos Protocolo") %>%
@@ -533,6 +538,7 @@ server <- function(input, output, session) {
       clearGroup("Postes Relevados") %>% clearGroup("Reordenamiento Telefónica - Postes") %>% 
       clearGroup("Trazas Relevadas") %>% clearGroup("Trazas Intimadas") %>% clearGroup("Tendido de Policía Federal")
     
+    # Carga completa de vectores al grupo correspondiente
     if (nrow(aph_r()) > 0) {
       proxy %>% addPolygons(data = aph_r(), fillColor = ~pal_aph(cat_fmt), color = "#2c2c2c", weight = 2, opacity = 1, fillOpacity = 0.7, popup = ~popup_fmt, group = "Zonas APH")
     }
@@ -570,6 +576,7 @@ server <- function(input, output, session) {
       proxy %>% addPolylines(data = cao_r(), color = color_cao_metrotel, weight = 4, opacity = 1, popup = ~popup_fmt, group = "CAO Metrotel")
     }
     
+    # Aplicar inmediatamente la visibilidad actual basada en el estado de cada checkbox
     toggle_grupo <- function(condicion, nombre_grupo) {
       if (condicion) proxy %>% showGroup(nombre_grupo) else proxy %>% hideGroup(nombre_grupo)
     }
@@ -588,7 +595,7 @@ server <- function(input, output, session) {
     toggle_grupo(input$chk_policia, "Tendido de Policía Federal")
   })
   
-  # --- 2. CONTROL RÁPIDO DE VISIBILIDAD ---
+  # --- 2. CONTROL RÁPIDO DE VISIBILIDAD (Súper fluido: No re-dibuja nada en Leaflet) ---
   observeEvent(input$chk_reord, { if(input$chk_reord) leafletProxy("mapa") %>% showGroup("Reordenamiento de Cables") else leafletProxy("mapa") %>% hideGroup("Reordenamiento de Cables") }, ignoreInit = TRUE)
   observeEvent(input$chk_cao_metrotel, { if(input$chk_cao_metrotel) leafletProxy("mapa") %>% showGroup("CAO Metrotel") else leafletProxy("mapa") %>% hideGroup("CAO Metrotel") }, ignoreInit = TRUE)
   observeEvent(input$chk_aph, { if(input$chk_aph) leafletProxy("mapa") %>% showGroup("Zonas APH") else leafletProxy("mapa") %>% hideGroup("Zonas APH") }, ignoreInit = TRUE)

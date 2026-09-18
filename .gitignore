@@ -12,3 +12,4 @@ preprocesar.R
 index.Rmd
 app.R
 *.txt
+.Rproj.user

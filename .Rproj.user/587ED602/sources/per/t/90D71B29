@@ -3,24 +3,24 @@
     "path": "~/R/Trabajo/Mapa_Tendido_Aereo/app.R",
     "project_path": "app.R",
     "type": "r_source",
-    "hash": "2742780852",
+    "hash": "3275054569",
     "contents": "",
     "dirty": false,
     "created": 1789565305493.0,
     "source_on_save": false,
-    "relative_order": 1,
+    "relative_order": 2,
     "properties": {
         "source_window_id": "",
         "Source": "Source",
-        "cursorPosition": "16,83",
-        "scrollLine": "6"
+        "cursorPosition": "734,31",
+        "scrollLine": "727"
     },
     "folds": "",
-    "lastKnownWriteTime": 1789725147,
+    "lastKnownWriteTime": 1789729774,
     "encoding": "UTF-8",
     "collab_server": "",
     "source_window": "",
-    "last_content_update": 1789725147560,
+    "last_content_update": 1789729774,
     "read_only": false,
     "read_only_alternatives": []
 }
