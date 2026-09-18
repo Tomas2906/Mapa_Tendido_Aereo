@@ -1,0 +1,14 @@
+# Ocultar carpetas de datos originales y trabajo local
+data/
+preprocesar.R
+*.qmd
+*.shp
+*.dbf
+*.prj
+*.shx
+*.cpg
+
+# (Opcional) Si tampoco querés mostrar el código fuente RMarkdown en GitHub:
+index.Rmd
+app.R
+*.txt

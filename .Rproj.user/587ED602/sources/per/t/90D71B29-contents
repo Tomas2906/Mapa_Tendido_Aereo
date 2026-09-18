@@ -1,0 +1,787 @@
+options(shiny.selectize.check = FALSE)
+
+library(shiny)
+library(bslib)
+library(leaflet)
+library(plotly)
+library(sf)
+library(dplyr)
+library(openxlsx)
+library(tidyr)
+
+# =============================================================================
+# 0. RUTAS RELATIVAS AL PROYECTO
+# =============================================================================
+base_dir <- "data"
+
+path_cao_metrotel        <- file.path(base_dir, "CAO/Metrotel/CAO - METROTEL CALLEJERO.shp")
+path_reordenamiento     <- file.path(base_dir, "Reordenamiento_de_Cables/Reordenamiento de cables consolidado.shp")
+path_aph                <- file.path(base_dir, "Reordenamiento_de_Cables/Poligonos Protocolo/ZONAS APH - Nuevas Propuestas.shp")
+path_aph_trazas         <- file.path(base_dir, "APH/APH TA 2026.shp")
+path_protocolo          <- file.path(base_dir, "Reordenamiento_de_Cables/Poligonos Protocolo/Poligonos Protocolo.shp")
+path_asi_aereo          <- file.path(base_dir, "ASI/CAO ASI nuevos poligonos consolidado.shp")
+path_asi_soterrado      <- file.path(base_dir, "ASI/Tendido ASI.shp")
+path_postes             <- file.path(base_dir, "Postes_y_Trazas/CONSOLIDADO RELEVAMIENTO EN CALLE - POSTES.shp")
+path_telefonica_postes  <- file.path(base_dir, "Reordenamiento_de_Cables/TELEFONICA/TELEFONICA REORDENAMIENTO - PUNTOS.shp")
+path_trazas_rel         <- file.path(base_dir, "Postes_y_Trazas/TA RELEVADO.shp")
+path_policia            <- file.path(base_dir, "Tendido_Policia_Federal/Tendido_Policia_Federal.shp")
+path_intimadas          <- file.path(base_dir, "Trazas_intimadas/Trazas Intimadas.shp")
+
+# =============================================================================
+# 1. CARGA DE POLÍGONOS DE CABA (comunas / barrios)
+# =============================================================================
+url_comunas <- "https://cdn.buenosaires.gob.ar/datosabiertos/datasets/ministerio-de-educacion/comunas/comunas.geojson"
+url_barrios <- "https://cdn.buenosaires.gob.ar/datosabiertos/datasets/barrios/barrios.geojson"
+
+comunas_sf <- tryCatch(st_read(url_comunas, quiet = TRUE) %>% st_transform(4326), error = function(e) NULL)
+barrios_sf <- tryCatch(st_read(url_barrios, quiet = TRUE) %>% st_transform(4326), error = function(e) NULL)
+
+if (!is.null(comunas_sf) && !is.null(barrios_sf)) {
+  col_comuna_sf      <- names(comunas_sf)[grep("comuna", names(comunas_sf), ignore.case = TRUE)][1]
+  col_comuna_barrios <- names(barrios_sf)[grep("comuna", names(barrios_sf), ignore.case = TRUE)][1]
+  col_barrio_sf      <- names(barrios_sf)[grep("barrio", names(barrios_sf), ignore.case = TRUE)][1]
+  
+  lista_comunas <- sort(as.character(unique(comunas_sf[[col_comuna_sf]])))
+  lista_barrios <- sort(as.character(unique(barrios_sf[[col_barrio_sf]])))
+} else {
+  lista_comunas <- character()
+  lista_barrios <- character()
+}
+
+# =============================================================================
+# 2. HELPERS DE CARGA
+# =============================================================================
+obtener_atributo <- function(df, patron) {
+  coincidencias <- names(df)[grep(patron, names(df), ignore.case = TRUE)]
+  if (length(coincidencias) > 0) return(coincidencias[1]) else return(NULL)
+}
+
+limpiar_categoria <- function(x, default = "Sin Especificar") {
+  x <- as.character(x)
+  x[is.na(x) | trimws(x) == ""] <- default
+  x
+}
+
+safe_read <- function(path, geom_type = NULL) {
+  if (!file.exists(path)) {
+    warning(sprintf("ARCHIVO NO ENCONTRADO: %s", path))
+    return(NULL)
+  }
+  
+  s2_estaba_activo <- sf_use_s2()
+  sf_use_s2(FALSE)
+  on.exit(sf_use_s2(s2_estaba_activo), add = TRUE)
+  
+  d <- tryCatch(st_read(path, quiet = TRUE), error = function(e) NULL)
+  if (is.null(d)) return(NULL)
+  
+  if (is.na(st_crs(d))) {
+    bbox_tmp <- tryCatch(suppressWarnings(st_bbox(st_geometry(d))), error = function(e) NULL)
+    crs_inferido <- NA
+    if (!is.null(bbox_tmp) && all(is.finite(bbox_tmp))) {
+      if (abs(bbox_tmp[["xmin"]]) <= 180 && abs(bbox_tmp[["xmax"]]) <= 180 &&
+          abs(bbox_tmp[["ymin"]]) <= 90  && abs(bbox_tmp[["ymax"]]) <= 90) {
+        crs_inferido <- 4326
+      } else {
+        crs_inferido <- 5347
+      }
+    }
+    if (!is.na(crs_inferido)) {
+      st_crs(d) <- crs_inferido
+    } else {
+      return(NULL)
+    }
+  }
+  
+  n <- nrow(d)
+  if (n == 0) return(suppressWarnings(st_transform(d, 4326)))
+  
+  geom_col <- st_geometry(d)
+  ok <- rep(TRUE, n)
+  geoms_limpias <- vector("list", n)
+  
+  multi_type <- if (!is.null(geom_type) && geom_type != "POINT") {
+    switch(geom_type, "LINESTRING" = "MULTILINESTRING", "POLYGON" = "MULTIPOLYGON")
+  } else NULL
+  
+  for (i in seq_len(n)) {
+    resultado <- tryCatch({
+      gi <- suppressWarnings(st_zm(geom_col[i], drop = TRUE, what = "ZM"))
+      if (any(suppressWarnings(st_is_empty(gi)))) stop("vacío")
+      if (!is.null(geom_type)) {
+        gi <- suppressWarnings(st_collection_extract(gi, geom_type))
+        if (length(gi) == 0 || any(suppressWarnings(st_is_empty(gi)))) stop("vacío")
+        if (!is.null(multi_type)) gi <- suppressWarnings(st_cast(gi, multi_type))
+      }
+      gi
+    }, error = function(e) NULL)
+    
+    if (is.null(resultado)) ok[i] <- FALSE else geoms_limpias[[i]] <- resultado
+  }
+  
+  if (!any(ok)) return(suppressWarnings(st_transform(d[0, , drop = FALSE], 4326)))
+  
+  d_ok <- d[ok, , drop = FALSE]
+  st_geometry(d_ok) <- do.call(c, geoms_limpias[ok])
+  
+  if (identical(geom_type, "POINT")) {
+    tipos_geom <- tryCatch(unique(as.character(st_geometry_type(d_ok))), error = function(e) character())
+    if (any(tipos_geom == "MULTIPOINT")) {
+      d_ok <- tryCatch(suppressWarnings(st_cast(d_ok, "POINT", warn = FALSE)), error = function(e) d_ok)
+    }
+  }
+  
+  suppressWarnings(st_transform(d_ok, 4326))
+}
+
+calc_longitud <- function(d) {
+  if (nrow(d) == 0) return(numeric(0))
+  sf_use_s2(FALSE)
+  on.exit(sf_use_s2(TRUE), add = TRUE)
+  as.numeric(suppressWarnings(st_length(d)))
+}
+
+armar_popup <- function(nombre_capa, calle = "-", desde = "-", hasta = "-", empresa = NULL) {
+  pop <- paste0("<div style='font-family: sans-serif; font-size: 12px;'>",
+                "<b>Capa: </b>", nombre_capa, "<br>",
+                "<b>Calle: </b>", calle, "<br>",
+                "<b>Desde: </b>", desde, "<br>",
+                "<b>Hasta: </b>", hasta)
+  if (!is.null(empresa)) {
+    pop <- paste0(pop, "<br><b>Empresa: </b>", empresa)
+  }
+  paste0(pop, "</div>")
+}
+
+extraer_atributos_calle <- function(df, nombre_capa, empresa_default = "Sin Especificar") {
+  col_calle   <- obtener_atributo(df, "nomoficial|calle|arteria")
+  col_derini <- obtener_atributo(df, "alt_derini")
+  col_izqfin <- obtener_atributo(df, "alt_izqfin")
+  
+  if (!is.null(col_derini) && !is.null(col_izqfin)) {
+    col_desde <- col_derini
+    col_hasta <- col_izqfin
+  } else {
+    col_desde <- obtener_atributo(df, "desde|inicio|calle_desde")
+    col_hasta <- obtener_atributo(df, "hasta|fin|calle_hasta")
+  }
+  
+  col_empresa <- obtener_atributo(df, "empresa|operador|prestador")
+  
+  df$calle_fmt   <- if (!is.null(col_calle)) as.character(df[[col_calle]]) else "-"
+  df$desde_fmt   <- if (!is.null(col_desde)) as.character(df[[col_desde]]) else "-"
+  df$hasta_fmt   <- if (!is.null(col_hasta)) as.character(df[[col_hasta]]) else "-"
+  df$empresa_fmt <- if (!is.null(col_empresa)) limpiar_categoria(df[[col_empresa]], empresa_default) else empresa_default
+  df$popup_fmt   <- armar_popup(nombre_capa, df$calle_fmt, df$desde_fmt, df$hasta_fmt, df$empresa_fmt)
+  df$longitud_m  <- calc_longitud(df)
+  df
+}
+
+# =============================================================================
+# 2.b COLORES Y PALETAS
+# =============================================================================
+color_cao_metrotel      <- "#8B0000"
+color_asi_aereo         <- "#1F5FA8"
+color_asi_soterrado     <- "#2E9BD6"
+color_aph_trazas        <- "#8E44AD"
+color_trazas_intim      <- "#1E8449"
+color_policia           <- "#C9971B"
+color_telefonica_postes <- "#00A896"
+
+colores_reordenamiento <- c("TELECENTRO" = "#FF7F0E", "TELECOM" = "#1F77B4")
+colores_aph_poligonos  <- c("Zonas APH" = "#1F5FA8", "Zonas Propuestas" = "#E08A00")
+
+# =============================================================================
+# 3. CARGA DE CAPAS
+# =============================================================================
+
+# --- CAO Metrotel ---
+cao_metrotel <- safe_read(path_cao_metrotel, "LINESTRING")
+if (!is.null(cao_metrotel) && nrow(cao_metrotel) > 0) {
+  cao_metrotel <- extraer_atributos_calle(cao_metrotel, "CAO Metrotel", "CAO Metrotel")
+} else {
+  cao_metrotel <- st_sf(calle_fmt = character(), desde_fmt = character(), hasta_fmt = character(),
+                        empresa_fmt = character(), popup_fmt = character(), longitud_m = numeric(),
+                        geometry = st_sfc(), crs = 4326)
+}
+
+# --- Reordenamiento de Cables ---
+reordenamiento_raw <- safe_read(path_reordenamiento, "LINESTRING")
+if (!is.null(reordenamiento_raw) && nrow(reordenamiento_raw) > 0) {
+  reordenamiento_raw <- extraer_atributos_calle(reordenamiento_raw, "Reordenamiento de Cables", "Sin Especificar")
+  
+  reordenamiento <- reordenamiento_raw %>%
+    mutate(empresa_split = strsplit(as.character(empresa_fmt), "[-/,_]")) %>%
+    tidyr::unnest(empresa_split) %>%
+    mutate(empresa_clean = trimws(empresa_split)) %>%
+    filter(grepl("TELECENTRO|TELECOM", empresa_clean, ignore.case = TRUE)) %>%
+    mutate(empresa_fmt = ifelse(grepl("TELECENTRO", empresa_clean, ignore.case = TRUE), "TELECENTRO", "TELECOM")) %>%
+    select(-empresa_split, -empresa_clean)
+  
+  reordenamiento$popup_fmt <- armar_popup("Reordenamiento de Cables", reordenamiento$calle_fmt, 
+                                          reordenamiento$desde_fmt, reordenamiento$hasta_fmt, 
+                                          reordenamiento$empresa_fmt)
+} else {
+  reordenamiento <- st_sf(calle_fmt = character(), desde_fmt = character(), hasta_fmt = character(),
+                          empresa_fmt = character(), popup_fmt = character(), longitud_m = numeric(),
+                          geometry = st_sfc(), crs = 4326)
+}
+pal_reord <- colorFactor(palette = unname(colores_reordenamiento), domain = names(colores_reordenamiento))
+
+# --- Zonas APH (Polígonos) ---
+zonas_aph <- safe_read(path_aph, "POLYGON")
+if (!is.null(zonas_aph) && nrow(zonas_aph) > 0) {
+  col_obs <- obtener_atributo(zonas_aph, "OBSERVACIO|OBSERVACION|OBS")
+  obs_raw <- if (!is.null(col_obs)) as.character(zonas_aph[[col_obs]]) else ""
+  zonas_aph$cat_fmt <- ifelse(grepl("PROPUEST", toupper(trimws(obs_raw))), "Zonas Propuestas", "Zonas APH")
+  zonas_aph$popup_fmt <- armar_popup("Zonas APH", empresa = zonas_aph$cat_fmt)
+} else {
+  zonas_aph <- st_sf(cat_fmt = character(), popup_fmt = character(), geometry = st_sfc(), crs = 4326)
+}
+pal_aph <- colorFactor(palette = unname(colores_aph_poligonos), domain = names(colores_aph_poligonos))
+
+# --- Trazas APH ---
+aph_trazas <- safe_read(path_aph_trazas, "LINESTRING")
+if (!is.null(aph_trazas) && nrow(aph_trazas) > 0) {
+  aph_trazas <- extraer_atributos_calle(aph_trazas, "Trazas APH", "Trazas APH")
+} else {
+  aph_trazas <- st_sf(calle_fmt = character(), desde_fmt = character(), hasta_fmt = character(),
+                      empresa_fmt = character(), popup_fmt = character(), longitud_m = numeric(),
+                      geometry = st_sfc(), crs = 4326)
+}
+
+# --- Polígonos Protocolo ---
+poligonos_protocolo <- safe_read(path_protocolo, "POLYGON")
+if (!is.null(poligonos_protocolo) && nrow(poligonos_protocolo) > 0) {
+  col_zona <- obtener_atributo(poligonos_protocolo, "^ZONA$|ZONA_")
+  poligonos_protocolo$cat_fmt <- if (!is.null(col_zona)) limpiar_categoria(poligonos_protocolo[[col_zona]], "Sin Categoría") else "Sin Categoría"
+  poligonos_protocolo$popup_fmt <- armar_popup("Polígonos Protocolo", empresa = poligonos_protocolo$cat_fmt)
+} else {
+  poligonos_protocolo <- st_sf(cat_fmt = character(), popup_fmt = character(), geometry = st_sfc(), crs = 4326)
+}
+pal_protocolo     <- colorFactor("Set3", domain = poligonos_protocolo$cat_fmt, na.color = "#95a5a6")
+niveles_protocolo <- sort(unique(poligonos_protocolo$cat_fmt))
+items_protocolo   <- setNames(as.character(pal_protocolo(niveles_protocolo)), niveles_protocolo)
+
+# --- Tendido ASI ---
+asi_aereo <- safe_read(path_asi_aereo, "LINESTRING")
+if (!is.null(asi_aereo) && nrow(asi_aereo) > 0) {
+  asi_aereo <- extraer_atributos_calle(asi_aereo, "Tendido ASI - Aéreo", "ASI Aéreo")
+} else {
+  asi_aereo <- st_sf(calle_fmt = character(), desde_fmt = character(), hasta_fmt = character(),
+                     empresa_fmt = character(), popup_fmt = character(), longitud_m = numeric(),
+                     geometry = st_sfc(), crs = 4326)
+}
+
+asi_soterrado <- safe_read(path_asi_soterrado, "LINESTRING")
+if (!is.null(asi_soterrado) && nrow(asi_soterrado) > 0) {
+  asi_soterrado <- extraer_atributos_calle(asi_soterrado, "Tendido ASI - Soterrado", "ASI Soterrado")
+} else {
+  asi_soterrado <- st_sf(calle_fmt = character(), desde_fmt = character(), hasta_fmt = character(),
+                         empresa_fmt = character(), popup_fmt = character(), longitud_m = numeric(),
+                         geometry = st_sfc(), crs = 4326)
+}
+
+# --- Postes Relevados ---
+postes_relevados <- safe_read(path_postes, "POINT")
+if (!is.null(postes_relevados) && nrow(postes_relevados) > 0) {
+  col_tipo <- obtener_atributo(postes_relevados, "^TIPO$|TIPO_")
+  col_calle_p <- obtener_atributo(postes_relevados, "nomoficial|calle|arteria")
+  postes_relevados$calle_fmt <- if (!is.null(col_calle_p)) as.character(postes_relevados[[col_calle_p]]) else "-"
+  postes_relevados$cat_fmt <- if (!is.null(col_tipo)) limpiar_categoria(postes_relevados[[col_tipo]], "Sin Tipo") else "Sin Tipo"
+  postes_relevados$popup_fmt <- armar_popup("Postes Relevados", calle = postes_relevados$calle_fmt, empresa = postes_relevados$cat_fmt)
+} else {
+  postes_relevados <- st_sf(calle_fmt = character(), cat_fmt = character(), popup_fmt = character(), geometry = st_sfc(), crs = 4326)
+}
+pal_postes     <- colorFactor("Dark2", domain = postes_relevados$cat_fmt, na.color = "#95a5a6")
+niveles_postes <- sort(unique(postes_relevados$cat_fmt))
+items_postes   <- setNames(as.character(pal_postes(niveles_postes)), niveles_postes)
+
+# --- Reordenamiento Telefónica - Postes ---
+telefonica_postes <- safe_read(path_telefonica_postes, "POINT")
+if (!is.null(telefonica_postes) && nrow(telefonica_postes) > 0) {
+  col_calle_tel <- obtener_atributo(telefonica_postes, "nomoficial|calle|arteria")
+  telefonica_postes$calle_fmt <- if (!is.null(col_calle_tel)) as.character(telefonica_postes[[col_calle_tel]]) else "-"
+  telefonica_postes$cat_fmt <- "Reordenamiento Telefónica - Postes"
+  telefonica_postes$popup_fmt <- armar_popup("Reordenamiento Telefónica - Postes", calle = telefonica_postes$calle_fmt, empresa = "Telefónica")
+} else {
+  telefonica_postes <- st_sf(calle_fmt = character(), cat_fmt = character(), popup_fmt = character(), geometry = st_sfc(), crs = 4326)
+}
+
+# --- Trazas Relevadas ---
+trazas_relevadas <- safe_read(path_trazas_rel, "LINESTRING")
+if (!is.null(trazas_relevadas) && nrow(trazas_relevadas) > 0) {
+  trazas_relevadas <- extraer_atributos_calle(trazas_relevadas, "Trazas Relevadas", "Sin Especificar")
+} else {
+  trazas_relevadas <- st_sf(calle_fmt = character(), desde_fmt = character(), hasta_fmt = character(),
+                            empresa_fmt = character(), popup_fmt = character(), longitud_m = numeric(),
+                            geometry = st_sfc(), crs = 4326)
+}
+pal_trazas_rel     <- colorFactor("Set1", domain = trazas_relevadas$empresa_fmt, na.color = "#95a5a6")
+niveles_trazas_rel <- sort(unique(trazas_relevadas$empresa_fmt))
+items_trazas_rel   <- setNames(as.character(pal_trazas_rel(niveles_trazas_rel)), niveles_trazas_rel)
+
+# --- Trazas Intimadas ---
+trazas_intimadas <- safe_read(path_intimadas, "LINESTRING")
+if (!is.null(trazas_intimadas) && nrow(trazas_intimadas) > 0) {
+  trazas_intimadas <- extraer_atributos_calle(trazas_intimadas, "Trazas Intimadas", "Trazas Intimadas")
+} else {
+  trazas_intimadas <- st_sf(calle_fmt = character(), desde_fmt = character(), hasta_fmt = character(),
+                            empresa_fmt = character(), popup_fmt = character(), longitud_m = numeric(),
+                            geometry = st_sfc(), crs = 4326)
+}
+
+# --- Tendido Policía Federal ---
+tendido_policia <- safe_read(path_policia, "LINESTRING")
+if (!is.null(tendido_policia) && nrow(tendido_policia) > 0) {
+  tendido_policia <- extraer_atributos_calle(tendido_policia, "Tendido de Policía Federal", "Policía Federal")
+} else {
+  tendido_policia <- st_sf(calle_fmt = character(), desde_fmt = character(), hasta_fmt = character(),
+                           empresa_fmt = character(), popup_fmt = character(), longitud_m = numeric(),
+                           geometry = st_sfc(), crs = 4326)
+}
+
+# =============================================================================
+# 4. INTERFAZ DE USUARIO (UI)
+# =============================================================================
+subheader <- function(texto) {
+  div(style = "font-weight:700; font-size:11px; color:#7f8c8d; letter-spacing:0.5px; margin:10px 0 4px;", toupper(texto))
+}
+
+item_leyenda <- function(color, etiqueta) {
+  tags$div(
+    style = "display:flex; align-items:center; gap:6px; padding:1px 0;",
+    tags$span(style = paste0("width:10px; height:10px; min-width:10px; border-radius:3px; display:inline-block; background:", color, ";")),
+    tags$span(style = "font-size:11px; color:#34495e;", etiqueta)
+  )
+}
+
+capa_control <- function(inputId, label, value = FALSE, items = NULL) {
+  desplegable <- NULL
+  if (!is.null(items) && length(items) > 0) {
+    desplegable <- tags$details(
+      style = "flex-shrink:0;",
+      tags$summary(style = "cursor:pointer; font-size:10px; color:#95a5a6; list-style:none; outline:none; padding:2px 4px;", HTML("Ver colores &#9662;")),
+      tags$div(style = "margin: 4px 0 6px 6px; padding-left:8px; border-left:2px solid #ecf0f1;",
+               do.call(tagList, lapply(names(items), function(n) item_leyenda(items[[n]], n))))
+    )
+  }
+  tags$div(
+    style = "display:flex; align-items:flex-start; justify-content:space-between; gap:4px;",
+    tags$div(style = "flex:1; min-width:0;", checkboxInput(inputId, label, value = value)),
+    desplegable
+  )
+}
+
+ui <- fillPage(
+  theme = bs_theme(version = 5, bootswatch = "flatly"),
+  leafletOutput("mapa", width = "100%", height = "100vh"),
+  
+  # Panel Superior Derecho
+  absolutePanel(
+    top = 15, right = 15, width = 420,
+    style = "z-index: 1000;",
+    tags$details(
+      style = "background: rgba(255, 255, 255, 0.96); padding: 12px 16px; border-radius: 12px; box-shadow: 0 4px 20px rgba(0,0,0,0.15);",
+      tags$summary(
+        style = "cursor: pointer; font-weight: bold; color: #2c3e50; font-size: 14px; outline: none; display: flex; justify-content: space-between; align-items: center;",
+        HTML("Filtros Territoriales y Métricas <span style='font-size: 11px; color: #7f8c8d;'>(clic para desplegar) &#9662;</span>")
+      ),
+      tags$div(
+        style = "margin-top: 12px;",
+        fluidRow(
+          column(6, selectInput("sel_comuna", "Comuna:", choices = c("Todas", lista_comunas), selected = "Todas")),
+          column(6, selectInput("sel_barrio", "Barrio:", choices = c("Todos", lista_barrios), selected = "Todos"))
+        ),
+        hr(style = "margin: 8px 0;"),
+        fluidRow(
+          column(6,
+                 actionLink("btn_abrir_modal", style = "text-decoration: none; color: inherit; width: 100%; display: block;",
+                            uiOutput("tarjeta_registros"))
+          ),
+          column(6, uiOutput("tarjeta_km_totales"))
+        )
+      )
+    )
+  ),
+  
+  # Panel Lateral Izquierdo
+  absolutePanel(
+    bottom = 20, left = 20, width = 380,
+    style = "z-index: 1000;",
+    div(
+      style = "background: rgba(255, 255, 255, 0.96); padding: 12px 16px; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,0.12); margin-bottom: 10px; max-height: 340px; overflow-y: auto;",
+      h6("Control de Capas", style = "font-weight: bold; color: #2c3e50; margin-bottom: 4px; font-size: 13px;"),
+      subheader("Base"),
+      capa_control("chk_reord", "Reordenamiento de Cables", value = TRUE, items = as.list(colores_reordenamiento)),
+      subheader("Zonas APH"),
+      capa_control("chk_aph", "Zonas APH", value = FALSE, items = as.list(colores_aph_poligonos)),
+      capa_control("chk_aph_trazas", "Trazas APH", value = FALSE, items = list("Trazas APH" = color_aph_trazas)),
+      subheader("Polígonos Protocolo"),
+      capa_control("chk_protocolo", "Polígonos Protocolo", value = FALSE, items = as.list(items_protocolo)),
+      subheader("CAO"),
+      capa_control("chk_cao_metrotel", "CAO Metrotel", value = TRUE, items = list("CAO Metrotel" = color_cao_metrotel)),
+      subheader("Tendido ASI"),
+      capa_control("chk_asi_aereo", "Tendido ASI - Aéreo", value = FALSE, items = list("Aéreo" = color_asi_aereo)),
+      capa_control("chk_asi_soterrado", "Tendido ASI - Soterrado", value = FALSE, items = list("Soterrado" = color_asi_soterrado)),
+      subheader("Relevamiento"),
+      capa_control("chk_postes", "Postes Relevados", value = FALSE, items = as.list(items_postes)),
+      capa_control("chk_tel_postes", "Reordenamiento Telefónica - Postes", value = FALSE, items = list("Telefónica - Postes" = color_telefonica_postes)),
+      capa_control("chk_trazas_rel", "Trazas Relevadas", value = FALSE, items = as.list(items_trazas_rel)),
+      capa_control("chk_intimadas", "Trazas Intimadas", value = FALSE, items = list("Trazas Intimadas" = color_trazas_intim)),
+      subheader("Tendido"),
+      capa_control("chk_policia", "Tendido de Policía Federal", value = FALSE, items = list("Policía Federal" = color_policia))
+    ),
+    
+    # Panel de Gráficos
+    tags$details(
+      style = "background: rgba(255, 255, 255, 0.96); padding: 10px 14px; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,0.12);",
+      tags$summary(
+        style = "cursor: pointer; font-weight: bold; color: #2c3e50; font-size: 13px; outline: none; display: flex; justify-content: space-between; align-items: center;",
+        HTML("📊 Gráficos y Métricas <span style='font-size: 10px; color: #7f8c8d;'>(clic para desplegar) &#9662;</span>")
+      ),
+      tags$div(
+        style = "margin-top: 10px;",
+        actionButton("btn_calcular", "⚡ Calcular / Actualizar Métricas", class = "btn-primary w-100 mb-2", style = "font-size: 12px; font-weight: bold;"),
+        tabsetPanel(
+          id = "tabs_graficos",
+          type = "tabs",
+          tabPanel("Tramos", style = "padding-top: 6px;", plotlyOutput("grafico_tramos_dona", height = "170px")),
+          tabPanel("KM por Empresa", style = "padding-top: 6px;", plotlyOutput("grafico_km_empresa", height = "170px")),
+          tabPanel("Postes", style = "padding-top: 6px;", plotlyOutput("grafico_postes_tipo", height = "170px"))
+        )
+      )
+    )
+  )
+)
+
+# =============================================================================
+# 5. SERVIDOR (SERVER)
+# =============================================================================
+server <- function(input, output, session) {
+  
+  observeEvent(input$sel_comuna, {
+    if (input$sel_comuna != "Todas" && !is.null(barrios_sf)) {
+      barrios_filtrados <- barrios_sf %>%
+        filter(as.character(.data[[col_comuna_barrios]]) == as.character(input$sel_comuna)) %>%
+        pull(.data[[col_barrio_sf]]) %>% as.character() %>% unique() %>% sort()
+      updateSelectInput(session, "sel_barrio", choices = c("Todos", barrios_filtrados), selected = "Todos")
+    } else {
+      updateSelectInput(session, "sel_barrio", choices = c("Todos", lista_barrios), selected = "Todos")
+    }
+  }, ignoreInit = FALSE)
+  
+  geo_filtro <- reactive({
+    if (input$sel_barrio != "Todos" && !is.null(barrios_sf)) {
+      barrios_sf %>% filter(as.character(.data[[col_barrio_sf]]) == input$sel_barrio)
+    } else if (input$sel_comuna != "Todas" && !is.null(comunas_sf)) {
+      comunas_sf %>% filter(as.character(.data[[col_comuna_sf]]) == input$sel_comuna)
+    } else {
+      NULL
+    }
+  })
+  
+  filtrar_capa <- function(sf_data, geom_type = "LINESTRING") {
+    if (nrow(sf_data) == 0) return(sf_data)
+    geo <- geo_filtro()
+    
+    if (is.null(geo) || nrow(geo) == 0) return(sf_data)
+    
+    res <- suppressWarnings(st_intersection(sf_data, st_geometry(geo)))
+    if (nrow(res) == 0) return(res[0, , drop = FALSE])
+    
+    res <- suppressWarnings(st_collection_extract(res, geom_type)) %>%
+      st_zm(drop = TRUE, what = "ZM") %>%
+      filter(!st_is_empty(.))
+    
+    if (geom_type == "POINT" && nrow(res) > 0) {
+      tipos_geom <- tryCatch(unique(as.character(st_geometry_type(res))), error = function(e) character())
+      if (any(tipos_geom == "MULTIPOINT")) {
+        res <- suppressWarnings(st_cast(res, "POINT", warn = FALSE))
+      }
+    }
+    res
+  }
+  
+  reord_r          <- reactive({ filtrar_capa(reordenamiento, "LINESTRING") })
+  cao_r            <- reactive({ filtrar_capa(cao_metrotel, "LINESTRING") })
+  aph_r            <- reactive({ filtrar_capa(zonas_aph, "POLYGON") })
+  aph_trazas_r     <- reactive({ filtrar_capa(aph_trazas, "LINESTRING") })
+  protocolo_r      <- reactive({ filtrar_capa(poligonos_protocolo, "POLYGON") })
+  asi_aereo_r      <- reactive({ filtrar_capa(asi_aereo, "LINESTRING") })
+  asi_sot_r        <- reactive({ filtrar_capa(asi_soterrado, "LINESTRING") })
+  postes_r         <- reactive({ filtrar_capa(postes_relevados, "POINT") })
+  tel_postes_r     <- reactive({ filtrar_capa(telefonica_postes, "POINT") })
+  trazas_rel_r     <- reactive({ filtrar_capa(trazas_relevadas, "LINESTRING") })
+  policia_r        <- reactive({ filtrar_capa(tendido_policia, "LINESTRING") })
+  intimadas_r      <- reactive({ filtrar_capa(trazas_intimadas, "LINESTRING") })
+  
+  output$mapa <- renderLeaflet({
+    leaflet() %>%
+      addTiles(group = "OpenStreetMap") %>%
+      setView(lng = -58.445, lat = -34.615, zoom = 12)
+  })
+  
+  # --- 1. DIBUJO DE CAPAS ---
+  observe({
+    proxy <- leafletProxy("mapa")
+    
+    proxy %>% 
+      clearGroup("Reordenamiento de Cables") %>% clearGroup("CAO Metrotel") %>%
+      clearGroup("Zonas APH") %>% clearGroup("Trazas APH") %>% clearGroup("Polígonos Protocolo") %>%
+      clearGroup("Tendido ASI - Aéreo") %>% clearGroup("Tendido ASI - Soterrado") %>%
+      clearGroup("Postes Relevados") %>% clearGroup("Reordenamiento Telefónica - Postes") %>% 
+      clearGroup("Trazas Relevadas") %>% clearGroup("Trazas Intimadas") %>% clearGroup("Tendido de Policía Federal")
+    
+    if (nrow(aph_r()) > 0) {
+      proxy %>% addPolygons(data = aph_r(), fillColor = ~pal_aph(cat_fmt), color = "#2c2c2c", weight = 2, opacity = 1, fillOpacity = 0.7, popup = ~popup_fmt, group = "Zonas APH")
+    }
+    if (nrow(aph_trazas_r()) > 0) {
+      proxy %>% addPolylines(data = aph_trazas_r(), color = color_aph_trazas, weight = 4, opacity = 1, popup = ~popup_fmt, group = "Trazas APH")
+    }
+    if (nrow(protocolo_r()) > 0) {
+      proxy %>% addPolygons(data = protocolo_r(), fillColor = ~pal_protocolo(cat_fmt), color = "#2c2c2c", weight = 2, opacity = 1, fillOpacity = 0.7, popup = ~popup_fmt, group = "Polígonos Protocolo")
+    }
+    if (nrow(asi_aereo_r()) > 0) {
+      proxy %>% addPolylines(data = asi_aereo_r(), color = color_asi_aereo, weight = 4, opacity = 1, popup = ~popup_fmt, group = "Tendido ASI - Aéreo")
+    }
+    if (nrow(asi_sot_r()) > 0) {
+      proxy %>% addPolylines(data = asi_sot_r(), color = color_asi_soterrado, weight = 4, opacity = 1, popup = ~popup_fmt, group = "Tendido ASI - Soterrado")
+    }
+    if (nrow(postes_r()) > 0) {
+      proxy %>% addCircleMarkers(data = postes_r(), color = "#ffffff", fillColor = ~pal_postes(cat_fmt), radius = 6, stroke = TRUE, weight = 1, fillOpacity = 1, popup = ~popup_fmt, group = "Postes Relevados")
+    }
+    if (nrow(tel_postes_r()) > 0) {
+      proxy %>% addCircleMarkers(data = tel_postes_r(), color = "#ffffff", fillColor = color_telefonica_postes, radius = 6, stroke = TRUE, weight = 1, fillOpacity = 1, popup = ~popup_fmt, group = "Reordenamiento Telefónica - Postes")
+    }
+    if (nrow(trazas_rel_r()) > 0) {
+      proxy %>% addPolylines(data = trazas_rel_r(), color = ~pal_trazas_rel(empresa_fmt), weight = 4, opacity = 1, popup = ~popup_fmt, group = "Trazas Relevadas")
+    }
+    if (nrow(intimadas_r()) > 0) {
+      proxy %>% addPolylines(data = intimadas_r(), color = color_trazas_intim, weight = 4.5, opacity = 1, dashArray = "4,4", popup = ~popup_fmt, group = "Trazas Intimadas")
+    }
+    if (nrow(policia_r()) > 0) {
+      proxy %>% addPolylines(data = policia_r(), color = color_policia, weight = 4.5, opacity = 1, popup = ~popup_fmt, group = "Tendido de Policía Federal")
+    }
+    if (nrow(reord_r()) > 0) {
+      proxy %>% addPolylines(data = reord_r(), color = ~pal_reord(empresa_fmt), weight = 4, opacity = 1, popup = ~popup_fmt, group = "Reordenamiento de Cables")
+    }
+    if (nrow(cao_r()) > 0) {
+      proxy %>% addPolylines(data = cao_r(), color = color_cao_metrotel, weight = 4, opacity = 1, popup = ~popup_fmt, group = "CAO Metrotel")
+    }
+    
+    toggle_grupo <- function(condicion, nombre_grupo) {
+      if (condicion) proxy %>% showGroup(nombre_grupo) else proxy %>% hideGroup(nombre_grupo)
+    }
+    
+    toggle_grupo(input$chk_reord, "Reordenamiento de Cables")
+    toggle_grupo(input$chk_cao_metrotel, "CAO Metrotel")
+    toggle_grupo(input$chk_aph, "Zonas APH")
+    toggle_grupo(input$chk_aph_trazas, "Trazas APH")
+    toggle_grupo(input$chk_protocolo, "Polígonos Protocolo")
+    toggle_grupo(input$chk_asi_aereo, "Tendido ASI - Aéreo")
+    toggle_grupo(input$chk_asi_soterrado, "Tendido ASI - Soterrado")
+    toggle_grupo(input$chk_postes, "Postes Relevados")
+    toggle_grupo(input$chk_tel_postes, "Reordenamiento Telefónica - Postes")
+    toggle_grupo(input$chk_trazas_rel, "Trazas Relevadas")
+    toggle_grupo(input$chk_intimadas, "Trazas Intimadas")
+    toggle_grupo(input$chk_policia, "Tendido de Policía Federal")
+  })
+  
+  # --- 2. CONTROL RÁPIDO DE VISIBILIDAD ---
+  observeEvent(input$chk_reord, { if(input$chk_reord) leafletProxy("mapa") %>% showGroup("Reordenamiento de Cables") else leafletProxy("mapa") %>% hideGroup("Reordenamiento de Cables") }, ignoreInit = TRUE)
+  observeEvent(input$chk_cao_metrotel, { if(input$chk_cao_metrotel) leafletProxy("mapa") %>% showGroup("CAO Metrotel") else leafletProxy("mapa") %>% hideGroup("CAO Metrotel") }, ignoreInit = TRUE)
+  observeEvent(input$chk_aph, { if(input$chk_aph) leafletProxy("mapa") %>% showGroup("Zonas APH") else leafletProxy("mapa") %>% hideGroup("Zonas APH") }, ignoreInit = TRUE)
+  observeEvent(input$chk_aph_trazas, { if(input$chk_aph_trazas) leafletProxy("mapa") %>% showGroup("Trazas APH") else leafletProxy("mapa") %>% hideGroup("Trazas APH") }, ignoreInit = TRUE)
+  observeEvent(input$chk_protocolo, { if(input$chk_protocolo) leafletProxy("mapa") %>% showGroup("Polígonos Protocolo") else leafletProxy("mapa") %>% hideGroup("Polígonos Protocolo") }, ignoreInit = TRUE)
+  observeEvent(input$chk_asi_aereo, { if(input$chk_asi_aereo) leafletProxy("mapa") %>% showGroup("Tendido ASI - Aéreo") else leafletProxy("mapa") %>% hideGroup("Tendido ASI - Aéreo") }, ignoreInit = TRUE)
+  observeEvent(input$chk_asi_soterrado, { if(input$chk_asi_soterrado) leafletProxy("mapa") %>% showGroup("Tendido ASI - Soterrado") else leafletProxy("mapa") %>% hideGroup("Tendido ASI - Soterrado") }, ignoreInit = TRUE)
+  observeEvent(input$chk_postes, { if(input$chk_postes) leafletProxy("mapa") %>% showGroup("Postes Relevados") else leafletProxy("mapa") %>% hideGroup("Postes Relevados") }, ignoreInit = TRUE)
+  observeEvent(input$chk_tel_postes, { if(input$chk_tel_postes) leafletProxy("mapa") %>% showGroup("Reordenamiento Telefónica - Postes") else leafletProxy("mapa") %>% hideGroup("Reordenamiento Telefónica - Postes") }, ignoreInit = TRUE)
+  observeEvent(input$chk_trazas_rel, { if(input$chk_trazas_rel) leafletProxy("mapa") %>% showGroup("Trazas Relevadas") else leafletProxy("mapa") %>% hideGroup("Trazas Relevadas") }, ignoreInit = TRUE)
+  observeEvent(input$chk_intimadas, { if(input$chk_intimadas) leafletProxy("mapa") %>% showGroup("Trazas Intimadas") else leafletProxy("mapa") %>% hideGroup("Trazas Intimadas") }, ignoreInit = TRUE)
+  observeEvent(input$chk_policia, { if(input$chk_policia) leafletProxy("mapa") %>% showGroup("Tendido de Policía Federal") else leafletProxy("mapa") %>% hideGroup("Tendido de Policía Federal") }, ignoreInit = TRUE)
+  
+  # --- 3. ENFOQUE TERRITORIAL ---
+  observe({
+    leafletProxy("mapa") %>% clearGroup("limite_seleccionado")
+    geo <- geo_filtro()
+    if (!is.null(geo) && nrow(geo) > 0) {
+      bbox <- st_bbox(geo)
+      leafletProxy("mapa") %>%
+        addPolygons(data = geo, color = "#2c3e50", weight = 3, fill = FALSE, dashArray = "6, 6", group = "limite_seleccionado") %>%
+        flyToBounds(bbox[["xmin"]], bbox[["ymin"]], bbox[["xmax"]], bbox[["ymax"]])
+    }
+  })
+  
+  # --- 4. CÁLCULO DE MÉTRICAS Y TABLAS ---
+  capas_visibles_sf <- reactive({
+    layers <- list()
+    if (input$chk_reord)        layers[["Reordenamiento de Cables"]]           <- reord_r()
+    if (input$chk_cao_metrotel) layers[["CAO Metrotel"]]                       <- cao_r()
+    if (input$chk_asi_aereo)    layers[["Tendido ASI - Aéreo"]]                <- asi_aereo_r()
+    if (input$chk_asi_soterrado)layers[["Tendido ASI - Soterrado"]]            <- asi_sot_r()
+    if (input$chk_trazas_rel)   layers[["Trazas Relevadas"]]                   <- trazas_rel_r()
+    if (input$chk_aph_trazas)   layers[["Trazas APH"]]                         <- aph_trazas_r()
+    if (input$chk_intimadas)    layers[["Trazas Intimadas"]]                   <- intimadas_r()
+    if (input$chk_policia)      layers[["Tendido de Policía Federal"]]         <- policia_r()
+    if (input$chk_postes)       layers[["Postes Relevados"]]                   <- postes_r()
+    if (input$chk_tel_postes)   layers[["Reordenamiento Telefónica - Postes"]] <- tel_postes_r()
+    layers
+  })
+  
+  df_trazas_detalle <- eventReactive(input$btn_calcular, {
+    layers <- capas_visibles_sf()
+    if (length(layers) == 0) return(data.frame(Capa = character(), Empresa = character(), longitud_m = numeric(), Tipo = character(), Color = character(), stringsAsFactors = FALSE))
+    
+    partes <- lapply(names(layers), function(nombre_capa) {
+      d <- layers[[nombre_capa]]
+      if (nrow(d) == 0) return(NULL)
+      empresa_vec <- if ("empresa_fmt" %in% names(d)) d$empresa_fmt else if ("cat_fmt" %in% names(d)) d$cat_fmt else nombre_capa
+      long_vec    <- if ("longitud_m" %in% names(d)) d$longitud_m else 0
+      tipo_geom   <- as.character(unique(st_geometry_type(d)))[1]
+      
+      color_vec <- switch(nombre_capa,
+                          "CAO Metrotel"                       = color_cao_metrotel,
+                          "Tendido ASI - Aéreo"                = color_asi_aereo,
+                          "Tendido ASI - Soterrado"            = color_asi_soterrado,
+                          "Trazas APH"                         = color_aph_trazas,
+                          "Trazas Relevadas"                   = as.character(pal_trazas_rel(empresa_vec)),
+                          "Trazas Intimadas"                   = color_trazas_intim,
+                          "Tendido de Policía Federal"         = color_policia,
+                          "Reordenamiento Telefónica - Postes" = color_telefonica_postes,
+                          "Reordenamiento de Cables"           = as.character(pal_reord(empresa_vec)),
+                          "#7F7F7F")
+      
+      data.frame(Capa = nombre_capa, Empresa = empresa_vec, longitud_m = long_vec, Tipo = tipo_geom, Color = color_vec, stringsAsFactors = FALSE)
+    })
+    bind_rows(partes)
+  }, ignoreNULL = FALSE)
+  
+  output$tarjeta_registros <- renderUI({
+    if (input$btn_calcular == 0) {
+      return(div(style = "background: #7f8c8d; color: white; padding: 12px; border-radius: 8px; text-align: center;",
+                 div(style = "font-size: 16px; font-weight: bold;", "-"),
+                 div(style = "font-size: 11px; opacity: 0.9;", "Sin calcular")))
+    }
+    n <- nrow(df_trazas_detalle())
+    div(style = "background: #2980b9; color: white; padding: 12px; border-radius: 8px; text-align: center; cursor: pointer;",
+        div(style = "font-size: 20px; font-weight: bold;", format(n, big.mark = ".")),
+        div(style = "font-size: 11px; opacity: 0.9;", "Registros Totales Visibles 🗎"))
+  })
+  
+  output$tarjeta_km_totales <- renderUI({
+    if (input$btn_calcular == 0) {
+      return(div(style = "background: #7f8c8d; color: white; padding: 12px; border-radius: 8px; text-align: center;",
+                 div(style = "font-size: 16px; font-weight: bold;", "-"),
+                 div(style = "font-size: 11px; opacity: 0.9;", "Sin calcular")))
+    }
+    km <- sum(df_trazas_detalle()$longitud_m, na.rm = TRUE) / 1000
+    div(style = "background: #27ae60; color: white; padding: 12px; border-radius: 8px; text-align: center;",
+        div(style = "font-size: 20px; font-weight: bold;", format(round(km, 2), big.mark = ".", decimal.mark = ",")),
+        div(style = "font-size: 11px; opacity: 0.9;", "KM Totales Visibles"))
+  })
+  
+  observeEvent(input$btn_abrir_modal, {
+    if (input$btn_calcular == 0) return(NULL)
+    showModal(modalDialog(
+      title = "Detalle de Capas Activas",
+      size = "l", easyClose = TRUE,
+      footer = tagList(
+        downloadButton("descargar_excel", "Descargar Excel (.xlsx)", class = "btn-success"),
+        modalButton("Cerrar")
+      ),
+      div(style = "max-height: 400px; overflow-y: auto;", tableOutput("tabla_original_unificada"))
+    ))
+  })
+  
+  output$tabla_original_unificada <- renderTable({
+    if (input$btn_calcular == 0) return(data.frame(Mensaje = "Presione el botón 'Calcular' para cargar los datos."))
+    layers <- capas_visibles_sf()
+    if (length(layers) == 0) return(data.frame(Mensaje = "No hay capas visibles cargadas."))
+    
+    partes <- lapply(names(layers), function(nombre) {
+      d <- layers[[nombre]]
+      if (nrow(d) == 0) return(NULL)
+      d_clean <- st_drop_geometry(d) %>% 
+        select(-any_of(c("popup_fmt", "calle_fmt", "desde_fmt", "hasta_fmt", "empresa_fmt", "longitud_m", "cat_fmt")))
+      d_clean <- cbind(Capa = nombre, d_clean)
+      d_clean
+    })
+    bind_rows(partes)
+  }, striped = TRUE, hover = TRUE, na = "-")
+  
+  output$descargar_excel <- downloadHandler(
+    filename = function() { paste0("Tendido_Aereo_", Sys.Date(), ".xlsx") },
+    content = function(file) {
+      wb <- createWorkbook()
+      layers <- capas_visibles_sf()
+      
+      for (nombre in names(layers)) {
+        d <- layers[[nombre]]
+        if (nrow(d) > 0) {
+          d_clean <- st_drop_geometry(d) %>% 
+            select(-any_of(c("popup_fmt", "calle_fmt", "desde_fmt", "hasta_fmt", "empresa_fmt", "longitud_m", "cat_fmt")))
+          
+          sheet_name <- substr(gsub("[^A-Za-z0-9_]", "_", nombre), 1, 31)
+          addWorksheet(wb, sheet_name)
+          writeData(wb, sheet_name, d_clean)
+        }
+      }
+      saveWorkbook(wb, file, overwrite = TRUE)
+    }
+  )
+  
+  df_empresa_resumen <- reactive({
+    if (input$btn_calcular == 0) return(data.frame(Empresa = character(), Tramos = numeric(), KM = numeric(), Color = character()))
+    df <- df_trazas_detalle()
+    if (nrow(df) == 0 || !"Tipo" %in% names(df)) return(data.frame(Empresa = character(), Tramos = numeric(), KM = numeric(), Color = character()))
+    df <- df %>% filter(Tipo != "POINT")
+    if (nrow(df) == 0) return(data.frame(Empresa = character(), Tramos = numeric(), KM = numeric(), Color = character()))
+    df %>%
+      group_by(Empresa, Color) %>%
+      summarise(Tramos = n(), KM = sum(longitud_m, na.rm = TRUE) / 1000, .groups = "drop") %>%
+      arrange(desc(Tramos))
+  })
+  
+  output$grafico_tramos_dona <- renderPlotly({
+    if (input$btn_calcular == 0) return(NULL)
+    df <- df_empresa_resumen()
+    if (nrow(df) == 0) return(NULL)
+    plot_ly(df, labels = ~Empresa, values = ~Tramos, type = 'pie', hole = 0.5,
+            marker = list(colors = ~Color),
+            textinfo = 'label+percent', insidetextorientation = 'radial') %>%
+      layout(margin = list(l = 10, r = 10, t = 10, b = 10), showlegend = FALSE)
+  })
+  
+  output$grafico_km_empresa <- renderPlotly({
+    if (input$btn_calcular == 0) return(NULL)
+    df <- df_empresa_resumen()
+    if (nrow(df) == 0) return(NULL)
+    plot_ly(df, x = ~round(KM, 2), y = ~reorder(Empresa, KM), type = 'bar', orientation = 'h',
+            marker = list(color = ~Color)) %>%
+      layout(margin = list(l = 75, r = 10, t = 10, b = 30), xaxis = list(title = "Kilómetros"), yaxis = list(title = ""))
+  })
+  
+  output$grafico_postes_tipo <- renderPlotly({
+    if (input$btn_calcular == 0) return(NULL)
+    
+    df_p1 <- postes_r() %>% st_drop_geometry() %>% select(Tipo = cat_fmt)
+    df_p2 <- tel_postes_r() %>% st_drop_geometry() %>% select(Tipo = cat_fmt)
+    
+    df_postes_comb <- bind_rows(df_p1, df_p2)
+    if (nrow(df_postes_comb) == 0) return(NULL)
+    
+    resumen <- df_postes_comb %>%
+      group_by(Tipo) %>%
+      summarise(Cantidad = n(), .groups = "drop") %>%
+      mutate(Color = ifelse(Tipo == "Reordenamiento Telefónica - Postes", color_telefonica_postes, as.character(pal_postes(Tipo)))) %>%
+      arrange(desc(Cantidad))
+    
+    plot_ly(resumen, x = ~Cantidad, y = ~reorder(Tipo, Cantidad), type = 'bar', orientation = 'h',
+            marker = list(color = ~Color)) %>%
+      layout(margin = list(l = 100, r = 10, t = 10, b = 30), xaxis = list(title = "Cantidad de Postes"), yaxis = list(title = ""))
+  })
+}
+
+shinyApp(ui, server)

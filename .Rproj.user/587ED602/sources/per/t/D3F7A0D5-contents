@@ -1,0 +1,867 @@
+---
+title: "Tendido Aéreo CABA"
+output:
+  html_document:
+    self_contained: false
+    lib_dir: "libs"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+library(leaflet)
+library(sf)
+library(dplyr)
+library(htmltools)
+library(htmlwidgets)
+library(RColorBrewer)
+library(jsonlite)
+
+dir_web <- file.path(getwd(), "data_web")
+
+obtener_json_atributos <- function(df) {
+  if (is.null(df) || nrow(df) == 0) return("[]")
+  df_no_geom <- st_drop_geometry(df)
+  jsonlite::toJSON(df_no_geom, auto_unbox = TRUE, null = "null")
+}
+
+armar_popup_trazas <- function(df, nombre_capa) {
+  if (is.null(df) || nrow(df) == 0) return(NULL)
+  col_calle   <- names(df)[grep("calle|nomoficial|arteria", names(df), ignore.case = TRUE)][1]
+  col_desde   <- names(df)[grep("desde|alt_derini|inicio", names(df), ignore.case = TRUE)][1]
+  col_hasta   <- names(df)[grep("hasta|alt_izqfin|fin", names(df), ignore.case = TRUE)][1]
+  col_empresa <- names(df)[grep("empresa|operador|prestador", names(df), ignore.case = TRUE)][1]
+  
+  calle_txt <- if (!is.na(col_calle)) as.character(df[[col_calle]]) else "-"
+  desde_txt <- if (!is.na(col_desde)) as.character(df[[col_desde]]) else "-"
+  hasta_txt <- if (!is.na(col_hasta)) as.character(df[[col_hasta]]) else "-"
+  emp_txt   <- if (!is.na(col_empresa)) as.character(df[[col_empresa]]) else nombre_capa
+  
+  paste0(
+    "<div style='font-family:sans-serif; font-size:12px;'>",
+    "<b>Capa: </b>", nombre_capa, "<br>",
+    "<b>Calle: </b>", calle_txt, "<br>",
+    "<b>Desde: </b>", desde_txt, "<br>",
+    "<b>Hasta: </b>", hasta_txt, "<br>",
+    "<b>Empresa: </b>", emp_txt,
+    "</div>"
+  )
+}
+
+cargar_geojson <- function(nombre, geom_tipo = NULL) {
+  path <- file.path(dir_web, paste0(nombre, ".geojson"))
+  if (!file.exists(path)) return(NULL)
+  d <- suppressWarnings(st_read(path, quiet = TRUE))
+  if (nrow(d) == 0) return(NULL)
+  if (!is.null(geom_tipo) && geom_tipo == "POINT") {
+    d <- suppressWarnings(st_cast(d, "POINT"))
+  }
+  d
+}
+
+# Carga de datos
+comunas            <- cargar_geojson("comunas")
+reordenamiento     <- cargar_geojson("reordenamiento")
+cao_metrotel       <- cargar_geojson("cao_metrotel")
+asi_aereo          <- cargar_geojson("asi_aereo")
+asi_soterrado      <- cargar_geojson("asi_soterrado")
+
+poligonos_prot     <- cargar_geojson("poligonos_protocolo")
+if (is.null(poligonos_prot)) poligonos_prot <- cargar_geojson("poligonos")
+zonas_aph          <- cargar_geojson("zonas_aph")
+trazas_aph         <- cargar_geojson("aph_trazas")
+if (is.null(trazas_aph)) trazas_aph <- cargar_geojson("trazas_aph")
+
+trazas_relevadas   <- cargar_geojson("trazas_relevadas")
+postes_relevados   <- cargar_geojson("postes_relevados", "POINT")
+trazas_intimadas   <- cargar_geojson("trazas_intimadas")
+telefonica_postes  <- cargar_geojson("telefonica_postes", "POINT")
+tendido_policia    <- cargar_geojson("tendido_policia")
+
+if (!is.null(comunas)) {
+  col_c <- names(comunas)[grep("comuna|nombre|id", names(comunas), ignore.case = TRUE)][1]
+  comunas$label_comuna <- if (!is.na(col_c)) paste0("Comuna ", comunas[[col_c]]) else "Comuna CABA"
+}
+
+if (!is.null(poligonos_prot)) {
+  col_zona <- names(poligonos_prot)[grep("zona|cat|tipo|nombre", names(poligonos_prot), ignore.case = TRUE)][1]
+  if (!is.na(col_zona)) {
+    poligonos_prot$zona_cat <- as.character(poligonos_prot[[col_zona]])
+    poligonos_prot$zona_cat[is.na(poligonos_prot$zona_cat) | poligonos_prot$zona_cat == ""] <- "S/D"
+  } else {
+    poligonos_prot$zona_cat <- "General"
+  }
+  zonas_unicas <- unique(poligonos_prot$zona_cat)
+  paleta_zonas <- colorFactor(palette = "Set3", domain = zonas_unicas)
+  poligonos_prot$color_map <- paleta_zonas(poligonos_prot$zona_cat)
+}
+
+reord_lista <- list()
+if (!is.null(reordenamiento)) {
+  col_emp <- names(reordenamiento)[grep("empresa|operador|prestador", names(reordenamiento), ignore.case = TRUE)][1]
+  if (!is.na(col_emp)) {
+    reordenamiento$empresa_cat <- as.character(reordenamiento[[col_emp]])
+    reordenamiento$empresa_cat[is.na(reordenamiento$empresa_cat) | reordenamiento$empresa_cat == ""] <- "S/D"
+  } else {
+    reordenamiento$empresa_cat <- "Sin Empresa"
+  }
+  empresas_unicas <- unique(reordenamiento$empresa_cat)
+  paleta_emp <- colorFactor(palette = "Set1", domain = empresas_unicas)
+  for (emp in empresas_unicas) {
+    sub_df <- reordenamiento[reordenamiento$empresa_cat == emp, ]
+    reord_lista[[emp]] <- list(df = sub_df, color = paleta_emp(emp), cant = nrow(sub_df))
+  }
+}
+
+trazas_rel_info <- list()
+if (!is.null(trazas_relevadas)) {
+  col_emp_rel <- names(trazas_relevadas)[grep("empresa|operador|prestador", names(trazas_relevadas), ignore.case = TRUE)][1]
+  if (!is.na(col_emp_rel)) {
+    trazas_relevadas$emp_cat <- as.character(trazas_relevadas[[col_emp_rel]])
+    trazas_relevadas$emp_cat[is.na(trazas_relevadas$emp_cat) | trazas_relevadas$emp_cat == ""] <- "S/D"
+  } else {
+    trazas_relevadas$emp_cat <- "General"
+  }
+  emp_cats <- unique(trazas_relevadas$emp_cat)
+  pal_trazas_rel <- colorFactor(palette = "Dark2", domain = emp_cats)
+  trazas_relevadas$color_map <- pal_trazas_rel(trazas_relevadas$emp_cat)
+  for (e in emp_cats) { trazas_rel_info[[e]] <- pal_trazas_rel(e) }
+}
+
+postes_rel_info <- list()
+if (!is.null(postes_relevados)) {
+  col_tipo <- names(postes_relevados)[grep("tipo|clase|categoria", names(postes_relevados), ignore.case = TRUE)][1]
+  if (!is.na(col_tipo)) {
+    postes_relevados$tipo_cat <- as.character(postes_relevados[[col_tipo]])
+    postes_relevados$tipo_cat[is.na(postes_relevados$tipo_cat) | postes_relevados$tipo_cat == ""] <- "S/D"
+  } else {
+    postes_relevados$tipo_cat <- "General"
+  }
+  tipo_cats <- unique(postes_relevados$tipo_cat)
+  pal_postes_rel <- colorFactor(palette = "Set2", domain = tipo_cats)
+  postes_relevados$color_map <- pal_postes_rel(postes_relevados$tipo_cat)
+  for (tp in tipo_cats) { postes_rel_info[[tp]] <- pal_postes_rel(tp) }
+}
+
+# Totales Iniciales para KPIs
+n_trazas_init <- sum(c(
+  if(!is.null(cao_metrotel)) nrow(cao_metrotel) else 0,
+  if(!is.null(reordenamiento)) nrow(reordenamiento) else 0,
+  if(!is.null(asi_aereo)) nrow(asi_aereo) else 0,
+  if(!is.null(asi_soterrado)) nrow(asi_soterrado) else 0,
+  if(!is.null(trazas_aph)) nrow(trazas_aph) else 0,
+  if(!is.null(trazas_relevadas)) nrow(trazas_relevadas) else 0,
+  if(!is.null(trazas_intimadas)) nrow(trazas_intimadas) else 0,
+  if(!is.null(tendido_policia)) nrow(tendido_policia) else 0
+))
+
+n_postes_init <- sum(c(
+  if(!is.null(postes_relevados)) nrow(postes_relevados) else 0,
+  if(!is.null(telefonica_postes)) nrow(telefonica_postes) else 0
+))
+
+color_comunas     <- "#2c3e50"
+color_cao         <- "#8B0000"
+color_asi_aereo   <- "#1F5FA8"
+color_asi_sot     <- "#2E9BD6"
+color_aph         <- "#8E44AD"
+color_trazas_aph  <- "#A569BD"
+color_trazas_rel  <- "#27AE60"
+color_postes_rel  <- "#E74C3C"
+color_intimadas   <- "#E67E22"
+color_tel_postes  <- "#00A896"
+color_policia     <- "#C9971B"
+
+fila_capa <- function(id, nombre, color, checked = FALSE, cant = 0, info_list = NULL,
+                      permitir_descarga = TRUE) {
+
+  btn_info <- NULL
+  if (!is.null(info_list) && length(info_list) > 0) {
+    items_html <- sapply(names(info_list), function(k) {
+      sprintf("<div class='popover-item'><span class='filtro-color' style='background:%s;'></span><span>%s</span></div>",
+              info_list[[k]], k)
+    })
+    contenido_popover <- sprintf("<div class='popover-title'>Categorías - %s</div>%s",
+                                 nombre, paste(items_html, collapse = ""))
+
+    plantilla_popover <- tags$div(class = "popover-source", id = paste0("pop-", id),
+                                  HTML(contenido_popover))
+
+    btn_info <- tagList(
+      tags$span(class = "btn-info-legend",
+                `data-pop-id` = paste0("pop-", id),
+                title = "Ver categorías",
+                "ℹ️"),
+      plantilla_popover
+    )
+  }
+
+  btn_descarga <- NULL
+  if (isTRUE(permitir_descarga)) {
+    btn_descarga <- tags$span(class = "btn-download-legend",
+                              `data-nombre` = nombre,
+                              title = "Descargar esta capa en KML",
+                              "📥")
+  }
+
+  tags$div(class = "filtro-item",
+    tags$input(type = "checkbox", id = id,
+               checked = if (checked) NA else NULL,
+               `data-nombre` = nombre,
+               `data-cant` = cant,
+               class = "chk-capa"),
+    tags$span(class = "filtro-color", style = sprintf("background:%s;", color)),
+    tags$label(`for` = id, nombre),
+    btn_info,
+    btn_descarga
+  )
+}
+```
+
+```{css, echo=FALSE}
+html, body {
+  height: 100%; margin: 0; padding: 0; overflow: hidden;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+}
+#header, .title, .author, .date { display: none !important; }
+
+.leaflet-container {
+  position: fixed !important; top: 0; left: 0; right: 0; bottom: 0;
+  width: 100% !important; height: 100% !important; z-index: 1;
+}
+
+.app-title {
+  position: fixed; top: 12px; left: 12px; z-index: 1000;
+  background: rgba(44,62,80,0.92); color: white; padding: 8px 16px;
+  border-radius: 8px; font-size: 15px; font-weight: bold;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.3);
+}
+
+.floating-panel {
+  background: rgba(255, 255, 255, 0.98); border-radius: 10px;
+  box-shadow: 0 4px 15px rgba(0,0,0,0.25); font-size: 13px;
+}
+.floating-panel .panel-header {
+  background: #2c3e50; color: white; padding: 10px 14px;
+  border-radius: 10px 10px 0 0; cursor: pointer;
+  display: flex; justify-content: space-between; align-items: center;
+  font-weight: bold; user-select: none;
+}
+.floating-panel .panel-header .chevron { transition: transform 0.25s; }
+.floating-panel.collapsed .panel-header .chevron { transform: rotate(-90deg); }
+.floating-panel .panel-body { padding: 12px 14px; max-height: 70vh; overflow-y: auto; }
+.floating-panel.collapsed .panel-body { display: none; }
+
+.filtro-categoria {
+  font-size: 11px; text-transform: uppercase; color: #7f8c8d; font-weight: bold;
+  border-top: 1px solid #eee; padding-top: 8px; margin-top: 8px;
+}
+.filtro-categoria:first-child { border-top: none; margin-top: 0; padding-top: 0; }
+.filtro-item { display: flex; align-items: center; gap: 6px; padding: 3px 0; position: relative; }
+.filtro-item input { cursor: pointer; }
+.filtro-color { width: 10px; height: 10px; border-radius: 2px; flex-shrink: 0; }
+.filtro-item label { cursor: pointer; margin: 0; flex-grow: 1; }
+
+.btn-info-legend {
+  cursor: pointer; font-size: 12px; margin-left: 4px; user-select: none; position: relative;
+}
+.btn-info-legend:hover { opacity: 0.8; }
+
+.btn-download-legend {
+  cursor: pointer; font-size: 12px; margin-left: 4px; user-select: none;
+}
+.btn-download-legend:hover { opacity: 0.8; }
+
+.popover-source { display: none; }
+
+#popover-flotante {
+  display: none; position: fixed; width: 210px;
+  background: #ffffff; border: 1px solid #bdc3c7; border-radius: 6px;
+  padding: 8px 10px; box-shadow: 0 4px 12px rgba(0,0,0,0.25); z-index: 5000;
+}
+#popover-flotante.active { display: block; }
+.popover-title { font-weight: bold; font-size: 11px; color: #2c3e50; margin-bottom: 6px; border-bottom: 1px solid #ecf0f1; padding-bottom: 3px; }
+.popover-item { display: flex; align-items: center; gap: 6px; font-size: 11px; padding: 2px 0; color: #34495e; }
+
+#panel-analitica { position: fixed; bottom: 16px; left: 16px; z-index: 1000; width: 340px; }
+
+.kpi-card {
+  background: #f8f9fa; border: 1px solid #e9ecef; border-left: 4px solid #2980b9;
+  border-radius: 6px; padding: 10px; margin-bottom: 8px;
+}
+.kpi-card:last-child { margin-bottom: 0; }
+.kpi-card.clickeable { cursor: pointer; background: #e8f8f5; border-left-color: #27ae60; transition: background 0.2s; }
+.kpi-card.clickeable:hover { background: #d5f5e3; }
+.kpi-valor { font-size: 22px; font-weight: bold; color: #2c3e50; }
+.kpi-label { font-size: 11px; color: #7f8c8d; }
+
+.modal-overlay {
+  display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+  background: rgba(0, 0, 0, 0.6); z-index: 9999;
+  align-items: center; justify-content: center;
+}
+.modal-overlay.active { display: flex; }
+
+.modal-content {
+  background: #ffffff; width: 85%; max-width: 1000px; height: 80vh;
+  border-radius: 12px; box-shadow: 0 5px 25px rgba(0,0,0,0.3);
+  display: flex; flex-direction: column; overflow: hidden;
+}
+
+.modal-header {
+  background: #2c3e50; color: white; padding: 14px 20px;
+  display: flex; justify-content: space-between; align-items: center;
+}
+.modal-header h3 { margin: 0; font-size: 16px; font-weight: bold; }
+.modal-close { cursor: pointer; font-size: 20px; font-weight: bold; line-height: 1; }
+
+.modal-body {
+  flex: 1; padding: 15px; overflow: auto; background: #f8f9fa;
+}
+
+.modal-footer {
+  padding: 12px 20px; border-top: 1px solid #dee2e6; background: #ffffff;
+  display: flex; justify-content: flex-end; gap: 10px;
+}
+
+.btn-excel {
+  background: #27ae60; color: white; border: none; padding: 8px 16px;
+  border-radius: 6px; font-weight: bold; cursor: pointer; font-size: 13px;
+  display: flex; align-items: center; gap: 6px; transition: background 0.2s;
+}
+.btn-excel:hover { background: #219150; }
+
+.tabla-datos {
+  width: 100%; border-collapse: collapse; font-size: 12px; background: white;
+}
+.tabla-datos th, .tabla-datos td {
+  border: 1px solid #dee2e6; padding: 8px 10px; text-align: left;
+}
+.tabla-datos th {
+  background: #34495e; color: white; position: sticky; top: 0; z-index: 10;
+}
+.tabla-datos tr:nth-child(even) { background: #f2f4f4; }
+```
+
+```{r mapa}
+elementos_panel <- list()
+
+# 1. Capas Base (Únicamente Comunas tildada)
+elementos_panel[[length(elementos_panel) + 1]] <- tags$div(class = "filtro-categoria", "Capas Base")
+if (!is.null(comunas)) elementos_panel[[length(elementos_panel) + 1]] <- fila_capa("cb-comunas", "Comunas", color_comunas, checked = TRUE, cant = nrow(comunas), permitir_descarga = FALSE)
+
+# 2. Reordenamiento de Cables
+if (length(reord_lista) > 0) {
+  elementos_panel[[length(elementos_panel) + 1]] <- tags$div(class = "filtro-categoria", "Reordenamiento de Cables")
+  idx <- 1
+  for (emp_nombre in names(reord_lista)) {
+    item_emp <- reord_lista[[emp_nombre]]
+    elementos_panel[[length(elementos_panel) + 1]] <- fila_capa(
+      id = paste0("cb-reord-", idx),
+      nombre = paste0("RDC - ", emp_nombre),
+      color = item_emp$color,
+      checked = FALSE,
+      cant = item_emp$cant
+    )
+    idx <- idx + 1
+  }
+}
+
+# 3. CAO
+elementos_panel[[length(elementos_panel) + 1]] <- tags$div(class = "filtro-categoria", "CAO")
+if (!is.null(cao_metrotel)) elementos_panel[[length(elementos_panel) + 1]] <- fila_capa("cb-cao", "CAO Metrotel", color_cao, checked = FALSE, cant = nrow(cao_metrotel))
+
+# 4. Tendido ASI
+elementos_panel[[length(elementos_panel) + 1]] <- tags$div(class = "filtro-categoria", "Tendido ASI")
+if (!is.null(asi_aereo)) elementos_panel[[length(elementos_panel) + 1]] <- fila_capa("cb-asi-a", "Tendido ASI - Aéreo", color_asi_aereo, checked = FALSE, cant = nrow(asi_aereo))
+if (!is.null(asi_soterrado)) elementos_panel[[length(elementos_panel) + 1]] <- fila_capa("cb-asi-s", "Tendido ASI - Soterrado", color_asi_sot, checked = FALSE, cant = nrow(asi_soterrado))
+
+# 5. Polígonos Protocolo - Zonas APH
+elementos_panel[[length(elementos_panel) + 1]] <- tags$div(class = "filtro-categoria", "Polígonos Protocolo - Zonas APH")
+if (!is.null(poligonos_prot)) elementos_panel[[length(elementos_panel) + 1]] <- fila_capa("cb-polig-prot", "Polígonos Protocolo", "#F39C12", checked = FALSE, cant = nrow(poligonos_prot))
+if (!is.null(zonas_aph)) elementos_panel[[length(elementos_panel) + 1]] <- fila_capa("cb-aph", "Zonas APH", color_aph, checked = FALSE, cant = nrow(zonas_aph))
+if (!is.null(trazas_aph)) elementos_panel[[length(elementos_panel) + 1]] <- fila_capa("cb-trazas-aph", "Trazas APH", color_trazas_aph, checked = FALSE, cant = nrow(trazas_aph))
+
+# 6. Relevamiento
+elementos_panel[[length(elementos_panel) + 1]] <- tags$div(class = "filtro-categoria", "Relevamiento")
+if (!is.null(trazas_relevadas)) elementos_panel[[length(elementos_panel) + 1]] <- fila_capa("cb-trazas-rel", "Trazas Relevadas", color_trazas_rel, checked = FALSE, cant = nrow(trazas_relevadas), info_list = trazas_rel_info)
+if (!is.null(postes_relevados)) elementos_panel[[length(elementos_panel) + 1]] <- fila_capa("cb-postes-rel", "Postes Relevados", color_postes_rel, checked = FALSE, cant = nrow(postes_relevados), info_list = postes_rel_info)
+if (!is.null(trazas_intimadas)) elementos_panel[[length(elementos_panel) + 1]] <- fila_capa("cb-intimadas", "Trazas Intimadas", color_intimadas, checked = FALSE, cant = nrow(trazas_intimadas))
+if (!is.null(telefonica_postes)) elementos_panel[[length(elementos_panel) + 1]] <- fila_capa("cb-tel-postes", "Telefónica Postes", color_tel_postes, checked = FALSE, cant = nrow(telefonica_postes))
+
+# 7. Tendido Aéreo
+elementos_panel[[length(elementos_panel) + 1]] <- tags$div(class = "filtro-categoria", "Tendido Aéreo")
+if (!is.null(tendido_policia)) elementos_panel[[length(elementos_panel) + 1]] <- fila_capa("cb-policia", "Tendido Policía Federal", color_policia, checked = FALSE, cant = nrow(tendido_policia))
+
+panel_filtros_html <- tags$div(id = "panel-filtros", class = "floating-panel", style = "width:310px;",
+  tags$div(class = "panel-header",
+           "Control de Capas",
+           tags$span(class = "chevron", HTML("&#9660;"))
+  ),
+  tags$div(class = "panel-body", elementos_panel)
+)
+
+mapa <- leaflet() %>%
+  addTiles(
+    urlTemplate = "https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",
+    options = tileOptions(maxZoom = 19, attribution = '&copy; OpenStreetMap contributors')
+  ) %>%
+  setView(lng = -58.445, lat = -34.615, zoom = 12)
+
+# Capas Base
+if (!is.null(comunas)) {
+  mapa <- mapa %>% addPolygons(data = comunas, color = color_comunas, weight = 1.5, fill = FALSE,
+                               group = "Comunas", label = ~label_comuna,
+                               options = pathOptions(data_json = obtener_json_atributos(comunas)))
+}
+
+# Reordenamiento por Empresa
+if (length(reord_lista) > 0) {
+  for (emp_nombre in names(reord_lista)) {
+    item_emp <- reord_lista[[emp_nombre]]
+    nombre_capa <- paste0("RDC - ", emp_nombre)
+    mapa <- mapa %>% addPolylines(data = item_emp$df, color = item_emp$color, weight = 3, opacity = 0.85,
+                                  popup = armar_popup_trazas(item_emp$df, nombre_capa),
+                                  group = nombre_capa,
+                                  options = pathOptions(data_json = obtener_json_atributos(item_emp$df)))
+  }
+}
+
+# CAO
+if (!is.null(cao_metrotel)) {
+  mapa <- mapa %>% addPolylines(data = cao_metrotel, color = color_cao, weight = 3, opacity = 0.8,
+                                popup = armar_popup_trazas(cao_metrotel, "CAO Metrotel"),
+                                group = "CAO Metrotel",
+                                options = pathOptions(data_json = obtener_json_atributos(cao_metrotel)))
+}
+
+# Tendido ASI
+if (!is.null(asi_aereo)) {
+  mapa <- mapa %>% addPolylines(data = asi_aereo, color = color_asi_aereo, weight = 3, opacity = 0.8,
+                                popup = armar_popup_trazas(asi_aereo, "Tendido ASI - Aéreo"),
+                                group = "Tendido ASI - Aéreo",
+                                options = pathOptions(data_json = obtener_json_atributos(asi_aereo)))
+}
+if (!is.null(asi_soterrado)) {
+  mapa <- mapa %>% addPolylines(data = asi_soterrado, color = color_asi_sot, weight = 3, opacity = 0.8,
+                                popup = armar_popup_trazas(asi_soterrado, "Tendido ASI - Soterrado"),
+                                group = "Tendido ASI - Soterrado",
+                                options = pathOptions(data_json = obtener_json_atributos(asi_soterrado)))
+}
+
+# Polígonos Protocolo - Zonas APH
+if (!is.null(poligonos_prot)) {
+  mapa <- mapa %>% addPolygons(data = poligonos_prot, color = ~color_map, weight = 2, fillOpacity = 0.4,
+                               popup = "<b>Capa:</b> Polígonos Protocolo", group = "Polígonos Protocolo",
+                               options = pathOptions(data_json = obtener_json_atributos(poligonos_prot)))
+}
+if (!is.null(zonas_aph)) {
+  mapa <- mapa %>% addPolygons(data = zonas_aph, color = color_aph, weight = 2, fillOpacity = 0.4,
+                               popup = "<b>Capa:</b> Zonas APH", group = "Zonas APH",
+                               options = pathOptions(data_json = obtener_json_atributos(zonas_aph)))
+}
+if (!is.null(trazas_aph)) {
+  mapa <- mapa %>% addPolylines(data = trazas_aph, color = color_trazas_aph, weight = 3, opacity = 0.8,
+                                popup = armar_popup_trazas(trazas_aph, "Trazas APH"),
+                                group = "Trazas APH",
+                                options = pathOptions(data_json = obtener_json_atributos(trazas_aph)))
+}
+
+# Relevamiento: Trazas Relevadas
+if (!is.null(trazas_relevadas)) {
+  mapa <- mapa %>% 
+    addPolylines(data = trazas_relevadas, color = ~color_map, weight = 3, opacity = 0.85,
+                 popup = armar_popup_trazas(trazas_relevadas, "Trazas Relevadas"),
+                 group = "Trazas Relevadas",
+                 options = pathOptions(data_json = obtener_json_atributos(trazas_relevadas)))
+}
+
+# Relevamiento: Postes Relevados
+if (!is.null(postes_relevados)) {
+  mapa <- mapa %>% 
+    addCircleMarkers(data = postes_relevados, radius = 5, color = "#FFFFFF",
+                     weight = 1.5, fillColor = ~color_map, fillOpacity = 1.0,
+                     popup = "<b>Capa:</b> Postes Relevados", group = "Postes Relevados",
+                     options = markerOptions(data_json = obtener_json_atributos(postes_relevados)))
+}
+
+# Relevamiento: Intimadas y Telefónica
+if (!is.null(trazas_intimadas)) {
+  mapa <- mapa %>% addPolylines(data = trazas_intimadas, color = color_intimadas, weight = 3, opacity = 0.85,
+                                popup = armar_popup_trazas(trazas_intimadas, "Trazas Intimadas"),
+                                group = "Trazas Intimadas",
+                                options = pathOptions(data_json = obtener_json_atributos(trazas_intimadas)))
+}
+if (!is.null(telefonica_postes)) {
+  mapa <- mapa %>% addCircleMarkers(data = telefonica_postes, radius = 5, color = "#FFFFFF",
+                                    weight = 1.5, fillColor = color_tel_postes, fillOpacity = 1.0,
+                                    popup = "<b>Capa:</b> Telefónica Postes", group = "Telefónica Postes",
+                                    options = markerOptions(data_json = obtener_json_atributos(telefonica_postes)))
+}
+
+# Tendido Aéreo
+if (!is.null(tendido_policia)) {
+  mapa <- mapa %>% addPolylines(data = tendido_policia, color = color_policia, weight = 3, opacity = 0.8,
+                                popup = armar_popup_trazas(tendido_policia, "Tendido Policía Federal"),
+                                group = "Tendido Policía Federal",
+                                options = pathOptions(data_json = obtener_json_atributos(tendido_policia)))
+}
+
+mapa <- mapa %>% addControl(html = as.character(panel_filtros_html), position = "topright")
+
+js_script <- HTML(r"(
+<script src='https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js'></script>
+<script>
+function toggleCapa(input) {
+  var nombre = input.getAttribute('data-nombre');
+  var visible = input.checked;
+  var layers = window.mapaCABA && window.mapaCABA._grupos ? window.mapaCABA._grupos[nombre] : null;
+
+  if (layers) {
+    layers.forEach(function(layer) {
+      if (visible) {
+        if (!window.mapaCABA.hasLayer(layer)) window.mapaCABA.addLayer(layer);
+      } else {
+        if (window.mapaCABA.hasLayer(layer)) window.mapaCABA.removeLayer(layer);
+      }
+    });
+  }
+  recalcularTotales();
+}
+
+function togglePopover(botonEl, id) {
+  var fuente = document.getElementById(id);
+  if (!fuente) return;
+
+  var flotante = document.getElementById('popover-flotante');
+  if (!flotante) {
+    flotante = document.createElement('div');
+    flotante.id = 'popover-flotante';
+    document.body.appendChild(flotante);
+  }
+
+  var mismoOrigenYaAbierto = flotante.classList.contains('active') && flotante.getAttribute('data-origen') === id;
+  flotante.classList.remove('active');
+  if (mismoOrigenYaAbierto) return;
+
+  flotante.innerHTML = fuente.innerHTML;
+  flotante.setAttribute('data-origen', id);
+
+  var rectBoton = botonEl.getBoundingClientRect();
+  var anchoPop = 210;
+  var left = rectBoton.left - anchoPop + rectBoton.width;
+  left = Math.max(8, Math.min(left, window.innerWidth - anchoPop - 8));
+  var top = rectBoton.bottom + 4;
+
+  flotante.style.left = left + 'px';
+  flotante.style.top = top + 'px';
+  flotante.classList.add('active');
+}
+
+function manejarClickPanel(e) {
+  var btnInfo = e.target.closest('.btn-info-legend');
+  if (btnInfo) {
+    e.stopPropagation();
+    togglePopover(btnInfo, btnInfo.getAttribute('data-pop-id'));
+    return;
+  }
+
+  var btnDesc = e.target.closest('.btn-download-legend');
+  if (btnDesc) {
+    e.stopPropagation();
+    descargarCapaKML(btnDesc.getAttribute('data-nombre'));
+    return;
+  }
+
+  var kpiDescargarTrazas = e.target.closest('#kpi-card-trazas');
+  if (kpiDescargarTrazas) {
+    abrirModalTabla('trazas');
+    return;
+  }
+
+  var kpiDescargarPostes = e.target.closest('#kpi-card-postes');
+  if (kpiDescargarPostes) {
+    abrirModalTabla('postes');
+    return;
+  }
+
+  var header = e.target.closest('.panel-header');
+  if (header) {
+    header.parentElement.classList.toggle('collapsed');
+    return;
+  }
+}
+
+document.addEventListener('change', function(e) {
+  if (e.target.classList && e.target.classList.contains('chk-capa')) {
+    toggleCapa(e.target);
+  }
+});
+
+document.addEventListener('click', function(e) {
+  var flotante = document.getElementById('popover-flotante');
+  if (flotante && flotante.classList.contains('active') && !e.target.closest('#popover-flotante')) {
+    flotante.classList.remove('active');
+  }
+});
+
+function recalcularTotales() {
+  var totalTrazas = 0;
+  var totalPostes = 0;
+
+  var checkboxes = document.querySelectorAll('#panel-filtros input[type="checkbox"]');
+  checkboxes.forEach(function(cb) {
+    if (cb.checked) {
+      var cant = parseInt(cb.getAttribute('data-cant')) || 0;
+      var nombre = cb.getAttribute('data-nombre') || '';
+
+      if (nombre.indexOf('Postes') !== -1 || nombre.indexOf('Telefónica') !== -1) {
+        totalPostes += cant;
+      } else if (nombre.indexOf('Comunas') === -1 && nombre.indexOf('Zonas APH') === -1 && nombre.indexOf('Polígonos') === -1) {
+        totalTrazas += cant;
+      }
+    }
+  });
+
+  var elemTrazas = document.getElementById('kpi-val-trazas');
+  var elemPostes = document.getElementById('kpi-val-postes');
+  if (elemTrazas) elemTrazas.innerText = totalTrazas.toLocaleString('es-AR');
+  if (elemPostes) elemPostes.innerText = totalPostes.toLocaleString('es-AR');
+}
+
+var registrosEstructurados = [];
+var tipoTablaActual = 'trazas';
+
+function cerrarModalTabla() {
+  var modal = document.getElementById('modal-datos');
+  if (modal) modal.classList.remove('active');
+}
+
+function abrirModalTabla(tipo) {
+  if (!window.mapaCABA || !window.mapaCABA._grupos) return;
+
+  tipoTablaActual = tipo || 'trazas';
+  registrosEstructurados = [];
+  var contenedorTabla = document.getElementById('contenedor-tabla-modal');
+  var tituloModal = document.getElementById('modal-titulo');
+  
+  if (tituloModal) {
+    tituloModal.innerText = (tipoTablaActual === 'postes') ? 'Detalle de Postes Visibles' : 'Detalle de Trazas Visibles';
+  }
+  
+  contenedorTabla.innerHTML = '';
+
+  document.querySelectorAll('#panel-filtros input[type="checkbox"]').forEach(function(cb) {
+    var nombre = cb.getAttribute('data-nombre');
+    var esPoste = (nombre.indexOf('Postes') !== -1 || nombre.indexOf('Telefónica') !== -1);
+    var esValido = (tipoTablaActual === 'postes') ? esPoste : (!esPoste && nombre !== 'Comunas' && nombre.indexOf('Zonas APH') === -1 && nombre.indexOf('Polígonos') === -1);
+
+    if (cb.checked && esValido && window.mapaCABA._grupos[nombre]) {
+      var layers = window.mapaCABA._grupos[nombre];
+      
+      layers.forEach(function(layer) {
+        var rawData = layer.options && layer.options.data_json;
+        if (rawData) {
+          try {
+            var items = typeof rawData === 'string' ? JSON.parse(rawData) : rawData;
+            items.forEach(function(item) {
+              var registro = { 'Capa': nombre };
+              Object.keys(item).forEach(function(key) {
+                if (key !== 'popup_fmt' && key !== 'color_map' && key !== 'empresa_cat') {
+                  registro[key] = (item[key] !== null && item[key] !== undefined) ? item[key] : '-';
+                }
+              });
+              registrosEstructurados.push(registro);
+            });
+          } catch(e) {
+            console.error('Error parseando data_json', e);
+          }
+        }
+      });
+    }
+  });
+
+  if (registrosEstructurados.length === 0) {
+    contenedorTabla.innerHTML = '<p style="text-align:center; padding:20px;">No hay datos visibles para mostrar en esta categoría.</p>';
+    document.getElementById('modal-datos').classList.add('active');
+    return;
+  }
+
+  var columnasSet = new Set();
+  registrosEstructurados.forEach(function(r) {
+    Object.keys(r).forEach(function(k) { columnasSet.add(k); });
+  });
+  var columnas = Array.from(columnasSet);
+
+  var htmlTabla = '<table class="tabla-datos"><thead><tr>';
+  columnas.forEach(function(col) {
+    htmlTabla += '<th>' + col + '</th>';
+  });
+  htmlTabla += '</tr></thead><tbody>';
+  
+  registrosEstructurados.forEach(function(r) {
+    htmlTabla += '<tr>';
+    columnas.forEach(function(col) {
+      htmlTabla += '<td>' + (r[col] !== undefined ? r[col] : '-') + '</td>';
+    });
+    htmlTabla += '</tr>';
+  });
+  
+  htmlTabla += '</tbody></table>';
+  contenedorTabla.innerHTML = htmlTabla;
+
+  document.getElementById('modal-datos').classList.add('active');
+}
+
+function descargarExcel() {
+  if (registrosEstructurados.length === 0) {
+    alert('No hay datos para exportar.');
+    return;
+  }
+  
+  var worksheet = XLSX.utils.json_to_sheet(registrosEstructurados);
+  var workbook = XLSX.utils.book_new();
+  var nombreHoja = tipoTablaActual === 'postes' ? 'Postes_Visibles' : 'Trazas_Visibles';
+  XLSX.utils.book_append_sheet(workbook, worksheet, nombreHoja);
+  
+  XLSX.writeFile(workbook, nombreHoja + '_Originales_CABA.xlsx');
+}
+
+function layerAKmlPlacemark(layer, nombreCapa) {
+  var out = '';
+  if (layer.getLatLng) {
+    var ll = layer.getLatLng();
+    out += '<Placemark><name>' + nombreCapa + '</name><Point><coordinates>' +
+           ll.lng + ',' + ll.lat + ',0</coordinates></Point></Placemark>';
+  } else if (layer.getLatLngs) {
+    var lls = layer.getLatLngs();
+    var anillos = Array.isArray(lls[0]) ? lls : [lls];
+    anillos.forEach(function(anillo) {
+      var pts = Array.isArray(anillo[0]) ? anillo[0] : anillo;
+      if (!pts || !pts.length) return;
+      var coords = '';
+      pts.forEach(function(p) { if (p && typeof p.lng !== 'undefined') coords += p.lng + ',' + p.lat + ',0 '; });
+      if (coords) {
+        out += '<Placemark><name>' + nombreCapa + '</name><LineString><coordinates>' +
+               coords + '</coordinates></LineString></Placemark>';
+      }
+    });
+  }
+  return out;
+}
+
+function construirKML(gruposAExportar) {
+  var xmlnsStr = 'http' + '://' + 'www.opengis.net/kml/2.2';
+  var kmlHeader = '<?xml version="1.0" encoding="UTF-8"?><kml xmlns="' + xmlnsStr + '"><Document>';
+  var kmlFooter = '</Document></kml>';
+  var kmlBody = '';
+
+  Object.keys(gruposAExportar).forEach(function(nombreCapa) {
+    var layers = gruposAExportar[nombreCapa];
+    kmlBody += '<Folder><name>' + nombreCapa + '</name>';
+    layers.forEach(function(layer) {
+      kmlBody += layerAKmlPlacemark(layer, nombreCapa);
+    });
+    kmlBody += '</Folder>';
+  });
+
+  return kmlHeader + kmlBody + kmlFooter;
+}
+
+function descargarBlobKML(contenidoKml, nombreArchivo) {
+  var blob = new Blob([contenidoKml], {type: 'application/vnd.google-earth.kml+xml'});
+  var link = document.createElement('a');
+  link.href = URL.createObjectURL(blob);
+  link.download = nombreArchivo;
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+  setTimeout(function() { URL.revokeObjectURL(link.href); }, 1000);
+}
+
+function descargarCapaKML(nombreCapa) {
+  if (!window.mapaCABA || !window.mapaCABA._grupos || !window.mapaCABA._grupos[nombreCapa]) {
+    alert('No se encontraron datos para la capa "' + nombreCapa + '".');
+    return;
+  }
+  var grupos = {};
+  grupos[nombreCapa] = window.mapaCABA._grupos[nombreCapa];
+  var kml = construirKML(grupos);
+  var archivo = nombreCapa.replace(/[^a-z0-9]+/gi, '_') + '.kml';
+  descargarBlobKML(kml, archivo);
+}
+</script>
+)" )
+
+mapa <- htmlwidgets::onRender(mapa, "
+function(el, x) {
+  var map = this;
+  window.mapaCABA = map;
+  window.mapaCABA._grupos = {};
+  
+  map.eachLayer(function(layer) {
+    var g = layer.options && layer.options.group;
+    if (g) {
+      if (!window.mapaCABA._grupos[g]) window.mapaCABA._grupos[g] = [];
+      window.mapaCABA._grupos[g].push(layer);
+
+      if (g !== 'Comunas') {
+        map.removeLayer(layer);
+      }
+    }
+  });
+
+  var panelFiltros = document.getElementById('panel-filtros');
+  if (panelFiltros) {
+    L.DomEvent.disableClickPropagation(panelFiltros);
+    L.DomEvent.disableScrollPropagation(panelFiltros);
+    panelFiltros.addEventListener('click', manejarClickPanel);
+  }
+  var panelAnalitica = document.getElementById('panel-analitica');
+  if (panelAnalitica) {
+    L.DomEvent.disableClickPropagation(panelAnalitica);
+    L.DomEvent.disableScrollPropagation(panelAnalitica);
+    panelAnalitica.addEventListener('click', manejarClickPanel);
+  }
+
+  setTimeout(recalcularTotales, 500);
+}
+")
+
+panel_analitica_html <- tags$div(id = "panel-analitica", class = "floating-panel",
+  tags$div(class = "panel-header",
+           "Métricas",
+           tags$span(class = "chevron", HTML("&#9660;"))
+  ),
+  tags$div(class = "panel-body",
+    tags$div(id = "kpi-card-trazas", class = "kpi-card clickeable",
+      tags$div(id = "kpi-val-trazas", class = "kpi-valor", format(n_trazas_init, big.mark = ".")),
+      tags$div(class = "kpi-label", "Total Registros Trazas (Clic para ver tabla y exportar Excel 📊)")
+    ),
+    tags$div(id = "kpi-card-postes", class = "kpi-card clickeable",
+      tags$div(id = "kpi-val-postes", class = "kpi-valor", format(n_postes_init, big.mark = ".")),
+      tags$div(class = "kpi-label", "Total Postes Relevados (Clic para ver tabla y exportar Excel 📊)")
+    )
+  )
+)
+
+modal_html <- tags$div(id = "modal-datos", class = "modal-overlay",
+  tags$div(class = "modal-content",
+    tags$div(class = "modal-header",
+      tags$h3(id = "modal-titulo", "Detalle de Registros Visibles"),
+      tags$span(class = "modal-close", onclick = "cerrarModalTabla()", "×")
+    ),
+    tags$div(id = "contenedor-tabla-modal", class = "modal-body"),
+    tags$div(class = "modal-footer",
+      tags$button(class = "btn-excel", onclick = "descargarExcel()", "Descargar Excel (.xlsx) 📊")
+    )
+  )
+)
+
+tagList(
+  js_script,
+  tags$div(class = "app-title", "Tendido Aéreo CABA"),
+  mapa,
+  panel_analitica_html,
+  modal_html
+)
+```
